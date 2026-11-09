@@ -1,0 +1,23 @@
+- insert:
+    - id: dsh-dafeiyu-pro
+      name: dsh-dafeiyu-pro
+      config:
+        enabled: true
+        scale: 1
+        bubbleScale: 1
+        activityLevel: normal
+        reducedMotion: false
+        soundEnabled: true
+        soundStates:
+          - SUCCESS
+          - ERROR
+        bubbleMode: always
+        bubbleStates:
+          - SUCCESS
+          - ERROR
+          - WAITING
+        includeSubagents: false
+        webOverlay: false
+        clientTarget: auto
+        balanceEnabled: true
+        balanceSource: auto

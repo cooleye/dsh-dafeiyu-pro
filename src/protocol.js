@@ -25,6 +25,9 @@ export const CompanionMessageKind = Object.freeze({
   PONG: 'pong',
   CLOSED: 'closed',
   SHUTDOWN: 'shutdown',
+  // 语音对话（本 fork 新增）：字幕 + 实时音量 + 对话状态。
+  // 单独一种消息，是为了不被 state 消息里的空 message 覆盖掉气泡文字。
+  VOICE: 'voice',
 })
 
 // One-shot attention signals that do not change the companion state.

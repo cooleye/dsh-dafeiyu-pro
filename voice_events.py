@@ -49,6 +49,7 @@ class BaseEvents:
     def permission_ask(self) -> None: ...
     def error(self, message: str) -> None: ...
     def log(self, message: str) -> None: ...
+    def level(self, value: float, activity: str = "") -> None: ...
 
 
 class ConsoleEvents(BaseEvents):
@@ -177,3 +178,10 @@ class JsonlEvents(BaseEvents):
 
     def log(self, message: str) -> None:
         print(f"[voice] {message}", file=self.err, flush=True)
+
+    def level(self, value: float, activity: str = "") -> None:
+        """实时音量（0~1），驱动桌宠旁边的声波动画。
+
+        每 100ms 一条，纯数值，非常轻。
+        """
+        self._emit("level", level=round(float(value), 3), activity=activity)

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import random
 import sys
@@ -414,6 +415,16 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             self.overlay_message = ""
             self.overlay_detail = ""
             self.overlay_deadline_ms: int | None = None
+
+            # ── 语音对话（字幕 + 声波）──────────────────────────
+            # voice_active 为真时，state 消息里的空 message 不会清掉字幕，
+            # 否则每次状态变化（听/想/说）都会把字幕冲没。
+            self.voice_active = False
+            self.voice_text = ""
+            self.voice_activity: str | None = None
+            self.voice_level = 0.0
+            # 声波的滚动数据：保留最近 9 个音量值
+            self.voice_bars: list[float] = [0.0] * 9
             self.task = ""
             self.tasks: list[dict[str, Any]] = []
             self.webui_url = os.environ.get("DSH_DAFEIYU_WEBUI_URL", "http://127.0.0.1:3080/")
@@ -473,6 +484,9 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             elif kind == "balance":
                 self.balance_summary = str(message.get("summary", ""))[:200]
                 self._sync_bubble_size()
+            elif kind == "voice":
+                # 语音对话：字幕 + 实时音量。不碰宠物动画状态。
+                self._apply_voice(message)
             elif kind == "alert":
                 if message.get("alert") == "APPROVAL":
                     self._notify_alert("APPROVAL")
@@ -513,9 +527,17 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                     if self.model.pulse_state is None:
                         self._clear_overlay()
                     persistent = state in {"THINKING", "WORKING", "WAITING", "ERROR"}
+                    # ⚠️ 语音对话期间，state 消息带的是空 message。
+                    #    直接用它会把字幕冲掉（用户看到的就是「字幕一闪就没」）。
+                    #    这时沿用当前字幕。
+                    next_message = str(message.get("message", self.LABELS.get(state, state)))
+                    next_detail = str(message.get("detail", ""))
+                    if self.voice_active and not next_message.strip():
+                        next_message = self.status_message
+                        next_detail = self.status_detail
                     self._show_status(
-                        str(message.get("message", self.LABELS.get(state, state))),
-                        str(message.get("detail", "")),
+                        next_message,
+                        next_detail,
                         state,
                         None if persistent else 4200,
                     )
@@ -525,7 +547,13 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             self._sync_bubble_size()
             self.update()
             if snapshot_path is not None and not self.snapshot_saved:
-                QTimer.singleShot(180, self._save_snapshot)
+                # 诊断快照默认 180ms 后拍。想看「收到语音消息之后」的画面时，
+                # 用 DSH_DAFEIYU_SNAPSHOT_DELAY_MS 把它调大。
+                try:
+                    snapshot_delay = max(0, int(os.environ.get("DSH_DAFEIYU_SNAPSHOT_DELAY_MS", "180")))
+                except ValueError:
+                    snapshot_delay = 180
+                QTimer.singleShot(snapshot_delay, self._save_snapshot)
 
         def _set_reduced_motion(self, enabled: bool) -> None:
             self.reduced_motion = enabled
@@ -862,6 +890,104 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             self.overlay_state = None
             self.overlay_deadline_ms = None
 
+        # ---------- 语音对话：字幕 + 声波 ----------
+
+        VOICE_PREFIX = {"user": "你说", "assistant": "大肥鱼", "notice": ""}
+
+        def _apply_voice(self, message: dict[str, Any]) -> None:
+            """处理 voice 消息：更新字幕、音量、对话状态。
+
+            设计上故意不复用 TASK/STATE：
+              TASK 会在几秒后过期，STATE 会用空 message 冲掉文字，
+              字幕需要「一直留到下一句」。
+            """
+            activity = message.get("activity")
+            if activity is not None and activity != "":
+                self.voice_activity = str(activity)
+
+            if "level" in message:
+                try:
+                    self._push_voice_level(float(message.get("level") or 0.0))
+                except (TypeError, ValueError):
+                    pass
+
+            if "text" in message:
+                text = str(message.get("text") or "")
+                if text:
+                    who = str(message.get("who") or "")
+                    prefix = self.VOICE_PREFIX.get(who, "")
+                    full = f"{prefix}：{text}" if prefix else text
+                    self.voice_text = full
+                    self.voice_active = True
+                    # ttl=None：一直显示，直到下一句或退下
+                    self._show_status(full, "", self.display_state, None)
+                else:
+                    # 空文本 = 清字幕（退下、回到待命）
+                    self.voice_text = ""
+                    self.voice_active = False
+                    self.status_message = ""
+                    self.status_detail = ""
+                    self.status_deadline_ms = 0
+
+            self.update()
+
+        def _push_voice_level(self, level: float) -> None:
+            """把音量推进声波缓冲（滚动窗口）。
+
+            ⚠️ 不要对整条缓冲做衰减：那会让老的值一路衰减到 0，
+            看起来就像「只有最后一根条在动」。
+            声波要的是「最近 9 个音量值的快照」，直接滚动就行。
+            """
+            level = max(0.0, min(1.0, level))
+            self.voice_level = level
+            self.voice_bars = self.voice_bars[1:] + [level]
+
+        def _draw_voice_wave(self, painter: QPainter) -> None:
+            """在宠物下方画一排声波条。
+
+            · 听你说话（listening/hearing）→ 蓝色，跟麦克风音量走
+            · 它在说话（speaking）→ 橙色，跟说话节奏走
+            · 其它状态 → 不画
+            """
+            if not self.voice_activity or self.voice_activity == "idle":
+                return
+            if not self.voice_bars:
+                return
+
+            active = self.voice_activity in {"listening", "hearing", "speaking", "thinking"}
+            if not active:
+                return
+
+            x, y, w, h = self._pet_rect()
+            center_x = x + w / 2.0
+            base_y = y + h - round(2 * self.scale)
+            count = len(self.voice_bars)
+            bar_w = max(3.0, round(7 * self.scale))
+            gap = max(2.0, round(5 * self.scale))
+            total = count * bar_w + (count - 1) * gap
+            left = center_x - total / 2.0
+            max_h = max(16.0, round(54 * self.scale))
+
+            speaking = self.voice_activity == "speaking"
+            color = QColor("#FF9F43") if speaking else QColor("#3FB8F5")
+            # 在听但还没出声时给一点底噪高度，否则只剩几个点，看不出是声波
+            floor = 0.0 if speaking else 0.14
+
+            painter.save()
+            painter.setPen(Qt.PenStyle.NoPen)
+            painter.setBrush(color)
+            for i, value in enumerate(self.voice_bars):
+                # 中间高两头低，像一段波形
+                shape = 0.5 + 0.5 * math.sin((i + 0.5) / count * math.pi)
+                bar_h = max(bar_w, max(value, floor) * max_h * shape)
+                bar_x = left + i * (bar_w + gap)
+                painter.drawRoundedRect(
+                    QRectF(bar_x, base_y - bar_h, bar_w, bar_h),
+                    bar_w / 2.0,
+                    bar_w / 2.0,
+                )
+            painter.restore()
+
         @staticmethod
         def _now_ms() -> int:
             return int(time.monotonic() * 1000)
@@ -1136,6 +1262,7 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                 # Keep the old frame opaque underneath so the pet never flashes transparent.
                 draw_pet(self.fade_from_pixmap, 1.0)
             draw_pet(pixmap, fade_alpha)
+            self._draw_voice_wave(painter)
 
         def mousePressEvent(self, event: QMouseEvent) -> None:
             if event.button() == Qt.MouseButton.LeftButton:

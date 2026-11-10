@@ -563,19 +563,34 @@ function mountCompanion(ctx, config = {}, eventCtx = ctx, logger) {
     busy: CompanionState.WORKING,
   }
 
-  function pushVoiceText(title, detail) {
-    if (!bridge || !detail) return
+  // ── 语音：字幕 + 音量 ──────────────────────────────────────────────
+  // 走独立的 VOICE 消息，不走 STATE/TASK：
+  //   · STATE 每次变化都会用空 message 覆盖气泡，字幕会被冲掉
+  //   · VOICE 只更新字幕/音量，不动宠物动画状态
+  /** 当前正在说的那句（流式累积） */
+  let voiceSayBuf = ''
+  let voiceSayWho = ''
+  let lastVoicePush = 0
+
+  function sendVoice(payload) {
+    if (!bridge) return
     try {
-      bridge.send(createMessage(CompanionMessageKind.TASK, {
-        task: '语音对话',
-        message: title,
-        detail: String(detail).slice(0, 300),
-        project: '大肥鱼',
-        progress: { step: 1, total: 1 },
-      }))
+      bridge.send(createMessage(CompanionMessageKind.VOICE, payload))
     } catch (error) {
-      logger.warn?.(`dsh-dafeiyu: 语音文字推送失败 ${error?.message ?? error}`)
+      logger.warn?.(`dsh-dafeiyu: 语音消息推送失败 ${error?.message ?? error}`)
     }
+  }
+
+  function pushVoiceText(who, text, force = false) {
+    const body = String(text ?? '').trim()
+    if (!body) return
+    // 流式字幕节流：同一个人、100ms 内不重复推
+    const now = Date.now()
+    if (!force && who === voiceSayWho && now - lastVoicePush < 100) return
+    voiceSayBuf = body
+    voiceSayWho = who
+    lastVoicePush = now
+    sendVoice({ who, text: body.slice(0, 300) })
   }
 
   function handleVoiceEvent(msg) {
@@ -592,31 +607,51 @@ function mountCompanion(ctx, config = {}, eventCtx = ctx, logger) {
               detail: '',
             }))
           }
+          // 说完/退下时把字幕清掉
+          if (msg.state === 'idle') {
+            voiceSayBuf = ''
+            voiceSayWho = ''
+            sendVoice({ activity: 'idle', level: 0, text: '' })
+          } else {
+            sendVoice({ activity: msg.state })
+          }
           break
         }
+        case 'level':
+          // 实时音量：驱动桌宠旁边的声波
+          sendVoice({ level: Number(msg.level) || 0, activity: msg.activity || '' })
+          break
         case 'user_text':
-          pushVoiceText('你说', msg.text)
+          pushVoiceText('user', msg.text, true)
+          break
+        case 'delta':
+          voiceSayBuf += String(msg.text ?? '')
+          pushVoiceText('assistant', voiceSayBuf)
+          break
+        case 'reply_start':
+          voiceSayBuf = ''
           break
         case 'reply_end':
-          pushVoiceText('大肥鱼', msg.text)
+          pushVoiceText('assistant', msg.text || voiceSayBuf, true)
           break
         case 'task_start':
-          pushVoiceText('派活', msg.task)
+          pushVoiceText('notice', `派活：${msg.task}`, true)
           break
         case 'permission_ask':
-          pushVoiceText('需要授权', '要写文件，等你答复')
+          pushVoiceText('notice', '要写文件，等你答复', true)
           break
         case 'task_progress':
-          pushVoiceText('干活中', msg.text)
+          pushVoiceText('notice', `干活中 · ${msg.text}`, true)
           break
         case 'task_cancel':
-          pushVoiceText('已取消', '任务已停止')
+          pushVoiceText('notice', '任务已停止', true)
           break
         case 'tool':
           logger.info?.(`[voice] 调用工具 ${msg.name}`)
           break
         case 'task_done':
           logger.info?.(`[voice] 任务${msg.ok ? '完成' : '失败'}`)
+          if (msg.text) pushVoiceText('notice', String(msg.text), true)
           break
         case 'error':
           logger.warn?.(`[voice] ${msg.message}`)

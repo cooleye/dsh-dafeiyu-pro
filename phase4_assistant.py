@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import argparse
+import math
 import re
 import sys
 import threading
@@ -601,6 +602,17 @@ class Assistant:
         if now - getattr(self, "_last_rms_log", 0.0) >= 3.0:
             self._last_rms_log = now
             self.ev.log(f"音量 {rms:.5f}（状态 {name}）")
+
+        # 实时音量给桌宠画声波。10Hz 就够了，再高没意义还刷管道。
+        if now - getattr(self, "_last_level_emit", 0.0) >= 0.1:
+            self._last_level_emit = now
+            level = min(1.0, rms * 12.0)
+            if name == "speaking":
+                # 说话时麦克风听到的是自己的回声，幅度很小。
+                # 这里叠一个随时间起伏的包络，让声波看起来「在说话」。
+                wave = abs(math.sin(now * 7.0)) * (0.55 + 0.45 * math.sin(now * 2.3))
+                level = max(level, 0.25 + 0.5 * wave)
+            self.ev.level(level, name)
 
         bar = "█" * int(min(rms * 200, 20))
         if isinstance(self.ev, ConsoleEvents):

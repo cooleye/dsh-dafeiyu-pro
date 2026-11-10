@@ -229,44 +229,54 @@ def run_wav(path: Path, model_dir: Path, verbose: bool) -> int:
     return 2
 
 
-def pick_input_device(preferred: int | None = None) -> tuple[int, int, str]:
-    """挑一个能真正打开录音的输入设备。
+def input_candidates(preferred: int | None = None,
+                     mode: str = "shared") -> list[tuple[int, int, str]]:
+    """按 mode 列出候选输入设备（(device, rate, 说明)）。
 
-    返回 (device_index, sample_rate, 说明)。
-
-    为什么需要这个：Windows 上 MME / DirectSound / WASAPI 可能被别的程序
-    独占（比如 DSH 的语音输入插件），只有 WDM-KS 是内核流、绕开混音器。
-    但 WDM-KS 也不是所有设备都有，所以逐个试。
+    只按后端优先级排序，**不预试开**——预试开要反复开关设备，
+    实测反而会把音频子系统搞挂（连 WDM-KS 都变 Invalid device）。
+    真正的可用性判断交给调用方：开流失败就换下一个。
     """
     import sounddevice as sd
 
     if preferred is not None:
         dev = sd.query_devices(preferred)
-        rate = int(dev["default_samplerate"])
-        return preferred, rate, f"手动指定：{dev['name']}"
+        return [(preferred, int(dev["default_samplerate"]), f"手动指定：{dev['name']}")]
 
-    candidates = []
-    # 按「独占风险从低到高」排序：WDM-KS 最不容易被占用
-    host_rank = {"Windows WDM-KS": 0, "Windows WASAPI": 1,
+    SHARED_RANK = {"Windows WASAPI": 0, "Windows DirectSound": 1, "MME": 2,
+                   "Windows WDM-KS": 9}
+    EXCLUSIVE_RANK = {"Windows WDM-KS": 0, "Windows WASAPI": 1,
+                      "Windows DirectSound": 2, "MME": 3}
+    AUTO_RANK = {"Windows WASAPI": 0, "Windows WDM-KS": 1,
                  "Windows DirectSound": 2, "MME": 3}
-    for i, h in enumerate(sd.query_hostapis()):
+
+    mode = (mode or "shared").lower()
+    host_rank = {"exclusive": EXCLUSIVE_RANK,
+                 "auto": AUTO_RANK}.get(mode, SHARED_RANK)
+
+    rows = []
+    for h in sd.query_hostapis():
         di = h.get("default_input_device", -1)
         if di is None or di < 0:
             continue
         dev = sd.query_devices(di)
-        rank = host_rank.get(h["name"], 9)
-        candidates.append((rank, h["name"], di, int(dev["default_samplerate"]), dev["name"]))
+        rows.append((host_rank.get(h["name"], 9), h["name"], di,
+                     int(dev["default_samplerate"]), dev["name"]))
+    rows.sort()
 
-    candidates.sort()
+    return [(di, rate, f"{host} / {name[:40]}") for _, host, di, rate, name in rows]
 
-    for rank, host, di, rate, name in candidates:
-        try:
-            sd.check_input_settings(device=di, samplerate=rate, channels=1, dtype="float32")
-            return di, rate, f"{host} / {name[:40]}"
-        except Exception:
-            continue
 
-    raise SystemExit("找不到可用的录音设备。检查：麦克风是否插好、是否被其他程序独占。")
+def pick_input_device(preferred: int | None = None,
+                      mode: str = "shared") -> tuple[int, int, str]:
+    """挑第一个候选（不验证能否打开）。
+
+    要自动回退请用 input_candidates()，自己逐个试。
+    """
+    cands = input_candidates(preferred, mode)
+    if not cands:
+        raise SystemExit("找不到任何输入设备。检查麦克风是否插好。")
+    return cands[0]
 
 
 def run_eval(model_dir: Path, pos_dir: Path, neg_dir: Path | None,

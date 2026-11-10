@@ -41,7 +41,12 @@ sys.path.insert(0, str(HERE))
 
 from asr_aliyun import SAMPLE_RATE, AliyunASR  # noqa: E402
 from audio_player import sapi_speak  # noqa: E402
-from phase0_kws_poc import create_spotter, pick_input_device, resample_to_16k  # noqa: E402
+from phase0_kws_poc import (  # noqa: E402
+    create_spotter,
+    input_candidates,
+    pick_input_device,
+    resample_to_16k,
+)
 from voice_config import load_keys  # noqa: E402
 
 # ---------- 参数（参考 desk-ai 实测值） ----------
@@ -77,6 +82,7 @@ class VoiceLoop:
         score: float = 3.0,
         threshold: float = 0.1,
         on_transcript=None,
+        audio_mode: str = "shared",
     ):
         self.api_key = api_key
         self.wake_reply = wake_reply
@@ -92,8 +98,10 @@ class VoiceLoop:
             model_dir, score=score, threshold=threshold
         )
 
-        # 设备
-        self.device, self.sample_rate, self.device_desc = pick_input_device(device)
+        # 设备：shared=共享（和 DSH 语音输入共存）/ exclusive=WDM-KS（独占）
+        # 存候选列表，开流失败时逐个回退（比预试开可靠）
+        self.audio_candidates = input_candidates(device, mode=audio_mode)
+        self.device, self.sample_rate, self.device_desc = self.audio_candidates[0]
         self.native_16k = self.sample_rate == 16000
 
         # 状态
@@ -137,6 +145,33 @@ class VoiceLoop:
         print(f"  唤醒后 {self.dialogue_timeout:.0f} 秒内不说话会退回待命\n")
         print("说「大肥鱼」叫醒它，然后直接说话。Ctrl+C 退出。\n")
 
+        # 逐个候选试开：开流失败就换下一个后端
+        # （check_input_settings 只校验格式，不代表现在能打开）
+        last_err = None
+        for idx, (dev, rate, desc) in enumerate(self.audio_candidates):
+            self.device, self.sample_rate, self.device_desc = dev, rate, desc
+            self.native_16k = rate == 16000
+            try:
+                self._run_stream()
+                return
+            except OSError as e:
+                last_err = e
+                if idx < len(self.audio_candidates) - 1:
+                    print(f"\n  ⚠️ {desc} 打不开（{e}），换下一个后端 …")
+                    continue
+                break
+
+        print(f"\n\n  ❌ 所有音频后端都打不开：{last_err}")
+        print("     多半是被别的程序占着了。检查：")
+        print("       · 终端里是不是还开着 phase4_assistant.py / phase2_listen.py")
+        print("       · 桌宠插件是不是已经启用了语音")
+        print("       · 微信 / QQ 语音、浏览器录音标签页")
+        print("     共享模式（WASAPI/DirectSound/MME）可以和别人共存，")
+        print("     独占模式（WDM-KS）不行。用 --audio-mode shared 试试。")
+        raise SystemExit(1)
+
+    def _run_stream(self) -> None:
+        """用当前 self.device 跑主循环。"""
         block = int(self.sample_rate * 0.1)
         aq: queue.Queue = queue.Queue()
 
@@ -156,16 +191,6 @@ class VoiceLoop:
             print(f"\n\n=== 共识别 {len(self.transcripts)} 句 ===")
             for i, t in enumerate(self.transcripts, 1):
                 print(f"  {i}. {t}")
-        except OSError as e:
-            # 最常见：麦克风被别的程序独占
-            # WDM-KS 是独占模式，终端版和桌宠版不能同时开麦
-            print(f"\n\n  ❌ 打开麦克风失败：{e}")
-            print("     多半是被别的程序占着了。检查：")
-            print("       · 终端里是不是还开着 phase4_assistant.py / phase2_listen.py")
-            print("       · 桌宠插件是不是已经启用了语音")
-            print("       · 微信 / QQ 语音、浏览器录音标签页")
-            print("     WDM-KS 是独占模式，同一时间只能有一个程序用。")
-            raise
 
     def _tick(self, frame: np.ndarray) -> None:
         # 重采样到 16k

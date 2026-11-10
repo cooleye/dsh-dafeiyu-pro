@@ -30,5 +30,7 @@
         voiceLlm: qwen-flash
         voiceAgent: true
         voiceAskPermission: true
+        # shared=共享（和 DSH 语音输入共存）/ exclusive=WDM-KS 独占
+        voiceAudioMode: shared
         voicePython: python
         voiceModelDir: ''

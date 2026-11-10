@@ -133,6 +133,7 @@ class Assistant:
         dialogue_timeout: float = 40.0,
         ask_permission: bool = True,
         allow_full_access: bool = False,
+        audio_mode: str = "shared",
         events: BaseEvents | None = None,
     ):
         self.ev = events or ConsoleEvents()
@@ -164,6 +165,7 @@ class Assistant:
             device=device,
             dialogue_timeout=dialogue_timeout,
             on_transcript=self._on_user_said,
+            audio_mode=audio_mode,
         )
         self.loop.on_voice_level = self._check_barge_in
         self.loop._render_status = self._render
@@ -476,6 +478,10 @@ def main() -> int:
                    help="信任模式：不问权限，任务一律给完整权限（谨慎）")
     p.add_argument("--no-ask", action="store_true",
                    help="不询问权限，任务一律用工作区沙箱（写桌面会失败）")
+    p.add_argument("--audio-mode", choices=["shared", "exclusive", "auto"],
+                   default="shared",
+                   help="音频后端：shared=共享（和 DSH 语音输入共存）/ "
+                        "exclusive=WDM-KS 独占（延迟最低但会挤掉别人）")
     args = p.parse_args()
 
     keys = load_keys()
@@ -499,6 +505,7 @@ def main() -> int:
         dialogue_timeout=args.timeout,
         ask_permission=not args.no_ask,
         allow_full_access=args.trusted,
+        audio_mode=args.audio_mode,
     )
     app.run()
     return 0

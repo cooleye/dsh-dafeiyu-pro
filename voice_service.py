@@ -107,6 +107,7 @@ class VoiceService:
             dialogue_timeout=float(self.config.get("dialogueTimeout", 40.0)),
             ask_permission=bool(self.config.get("askPermission", True)),
             allow_full_access=bool(self.config.get("allowFullAccess", False)),
+            audio_mode=self.config.get("audioMode") or "shared",
             events=self.ev,
         )
 

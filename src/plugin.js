@@ -71,6 +71,11 @@ export const Config = Schema.object({
   voiceLlm: Schema.string().default('qwen-flash').description('对话模型'),
   voiceAgent: Schema.boolean().default(true).description('长任务交给 DSH agent 执行'),
   voiceAskPermission: Schema.boolean().default(true).description('写工作区外文件前先语音确认'),
+  voiceAudioMode: Schema.union([
+    Schema.const('shared').description('共享（和 DSH 语音输入共存）'),
+    Schema.const('exclusive').description('独占 WDM-KS（延迟最低，会占住麦克风）'),
+    Schema.const('auto').description('自动'),
+  ]).default('shared').description('音频后端模式'),
   voicePython: Schema.string().default('python').description('Python 解释器（跑语音服务的那个）'),
   voiceModelDir: Schema.string().default('').description('KWS 模型目录（留空用插件目录下的 kws-model）'),
 }).description('由 DeepSeek Harness 状态驱动的桌面大肥鱼伴侣')
@@ -101,6 +106,7 @@ const defaults = Object.freeze({
   voiceLlm: 'qwen-flash',
   voiceAgent: true,
   voiceAskPermission: true,
+  voiceAudioMode: 'shared',
   voicePython: 'python',
   voiceModelDir: '',
 })
@@ -135,6 +141,7 @@ function publicConfig(config = {}) {
     voiceLlm: config.voiceLlm ?? defaults.voiceLlm,
     voiceAgent: config.voiceAgent !== false,
     voiceAskPermission: config.voiceAskPermission !== false,
+    voiceAudioMode: config.voiceAudioMode ?? defaults.voiceAudioMode,
     voicePython: config.voicePython || defaults.voicePython,
     voiceModelDir: config.voiceModelDir || '',
   }
@@ -606,6 +613,7 @@ function mountCompanion(ctx, config = {}, eventCtx = ctx, logger) {
       llmModel: next.voiceLlm || 'qwen-flash',
       useAgent: next.voiceAgent !== false,
       askPermission: next.voiceAskPermission !== false,
+      audioMode: next.voiceAudioMode || 'shared',
       modelDir: next.voiceModelDir || undefined,
     }
   }

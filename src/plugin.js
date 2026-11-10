@@ -22,7 +22,10 @@ const pkg = require('../package.json')
 
 import { createVoiceBridge } from './voice-bridge.js'
 
-export const name = 'dsh-dafeiyu'
+// 插件身份必须和包名 / bundle 条目 / client bundle id 一致。
+// 之前这里还是上游的 'dsh-dafeiyu'，和包名 'dsh-dafeiyu-pro' 不一致，
+// 排查启动失败时白花了不少时间 —— 统一掉。
+export const name = 'dsh-dafeiyu-pro'
 // The plugin's feature is built on session events, and mounting requires the
 // settings service (used to read live config). Keep the declared inject in
 // sync with those real hard dependencies instead of listing a service that

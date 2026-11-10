@@ -81,7 +81,7 @@ PERMISSION_FALLBACK = "没听到答复，我先在沙箱里做，文件会存在
 # （回声 0.06~0.19 vs 说话 0.026~0.058），所以不能靠阈值区分。
 # 改看「麦克风音量跟不跟播放音量走」：回声跟，真人说话不跟。
 BARGE_IN_CORR_WINDOW = 1.2      # 取最近多少秒的两条曲线做相关
-BARGE_IN_ECHO_MAX_LAG = 0.50    # 滞后搜索上限（声卡缓冲 + 系统混音）
+BARGE_IN_ECHO_MAX_LAG = 0.85    # 滞后搜索上限（声卡缓冲 + 系统混音 + 虚拟声卡）
 BARGE_IN_LAG_STEP = 0.05        # 滞后搜索步长
 BARGE_IN_MATCH_TOL = 0.08       # 找最近样本时允许的时间偏差
 BARGE_IN_ECHO_CORR = 0.55       # 相关系数高于此判为回声
@@ -365,6 +365,9 @@ class Assistant:
                     continue
                 xs.append(nearest[1])
                 ys.append(r)
+            # 注意：这里的 lag 是本轮实际用的值，别在自增之后再记，
+            # 否则日志里的滞后会整体大一个步长（踩过，会误判搜索范围不够）。
+            used_lag = lag
             lag += BARGE_IN_LAG_STEP
             if len(xs) < 5:
                 continue
@@ -372,7 +375,7 @@ class Assistant:
             if corr is None:
                 continue
             if best is None or corr > best[0]:
-                best = (corr, lag)
+                best = (corr, used_lag)
 
         return best
 

@@ -142,6 +142,48 @@ def run_bad_start_case() -> bool:
         MockASR.fail_start = False
 
 
+def run_stall_case() -> bool:
+    """音频回调停止供帧 → 必须抛 AudioStalled，不能把主循环一起拖死。
+
+    复现的 bug：回调里 print 把 stderr 管道写阻塞，
+    PortAudio 回调线程永久卡住，主循环死等 aq.get()，
+    整个服务假死（进程在、日志不动、CPU 为 0、叫它没反应）。
+    """
+    import phase2_listen as p2
+
+    old_stall = p2.STREAM_STALL_SECONDS
+    p2.STREAM_STALL_SECONDS = 0.3
+    try:
+        loop = make_loop()
+        loop.device, loop.sample_rate, loop.device_desc = 0, 16000, "mock"
+        loop.native_16k = True
+
+        class DeadStream:
+            """开流成功，但回调永远不触发。"""
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return False
+
+        with patch.object(p2.sd, "InputStream", lambda **kw: DeadStream()):
+            t0 = time.monotonic()
+            try:
+                loop._run_stream()
+                raised = False
+            except p2.AudioStalled:
+                raised = True
+            elapsed = time.monotonic() - t0
+
+        ok = raised and elapsed < 3.0
+        print(f"\n[音频流看门狗]  {'✅' if ok else '❌'}")
+        print(f"  抛出 AudioStalled={raised}  用时 {elapsed:.2f}s（应 < 3s）")
+        return ok
+    finally:
+        p2.STREAM_STALL_SECONDS = old_stall
+
+
 def main() -> int:
     print("=== Phase 2 状态机测试 ===")
     print("（用假 ASR，不联网、不用麦克风）\n")
@@ -163,6 +205,7 @@ def main() -> int:
         MockASR.start_delay = 0.0
 
         results.append(run_bad_start_case())
+        results.append(run_stall_case())
 
     print("\n" + "=" * 42)
     passed = sum(1 for r in results if r)

@@ -51,6 +51,17 @@ from voice_config import load_keys  # noqa: E402
 
 # ---------- 参数（参考 desk-ai 实测值） ----------
 
+# 音频流看门狗：超过这么多秒一帧都没来，就判定回调已经死了，重启音频流。
+# 踩过的坑：回调里 print 把 stderr 管道写满/写阻塞 →
+# PortAudio 回调线程永久卡死 → 主循环死等 aq.get() →
+# 整个语音服务假死（进程还在，日志不动，CPU 为 0，叫它没反应）。
+STREAM_STALL_SECONDS = 8.0
+
+
+class AudioStalled(Exception):
+    """音频回调停止供帧，需要重开流。"""
+
+
 # VAD：能量迟滞
 VAD_START_RMS = 0.03      # 起说话阈值
 VAD_END_RMS = 0.012       # 收尾阈值（说话中允许更低，避免句中停顿被切）
@@ -156,8 +167,11 @@ class VoiceLoop:
         #    回退逻辑形同虚设，报错直接冲到最外面。
         last_err = None
         opened = False
-        # 走两轮：设备刚被别的程序释放时，第一轮可能全失败，等一下再试
-        for attempt in range(2):
+        # 走多轮：设备刚被别的程序释放时，第一轮可能全失败，等一下再试。
+        # 流中途卡死（AudioStalled）也走这条重试路径 —— 服务得自己爬起来，
+        # 不能靠用户重启。
+        MAX_ATTEMPTS = 4
+        for attempt in range(MAX_ATTEMPTS):
             for idx, (dev, rate, desc) in enumerate(self.audio_candidates):
                 self.device, self.sample_rate, self.device_desc = dev, rate, desc
                 self.native_16k = rate == 16000
@@ -165,6 +179,11 @@ class VoiceLoop:
                     self._run_stream()
                     opened = True
                     break
+                except AudioStalled as e:
+                    last_err = e
+                    print(f"\n  🔄 {desc} 音频流卡死，重开 …", flush=True)
+                    time.sleep(0.5)
+                    break          # 同一个后端重开一次，别急着换设备
                 except (sd.PortAudioError, OSError) as e:
                     last_err = e
                     if idx < len(self.audio_candidates) - 1:
@@ -172,8 +191,8 @@ class VoiceLoop:
                         time.sleep(0.3)
             if opened:
                 return
-            if attempt == 0:
-                print("\n  ⏳ 所有后端都失败，1.5 秒后重试（设备可能还在释放）…")
+            if attempt < MAX_ATTEMPTS - 1:
+                print(f"\n  ⏳ 音频流重试 {attempt + 1}/{MAX_ATTEMPTS - 1}…", flush=True)
                 time.sleep(1.5)
 
         print(f"\n\n  ❌ 所有音频后端都打不开：{last_err}")
@@ -189,18 +208,39 @@ class VoiceLoop:
         """用当前 self.device 跑主循环。"""
         block = int(self.sample_rate * 0.1)
         aq: queue.Queue = queue.Queue()
+        last_status = [""]
 
         def cb(indata, frames, ti, status):
+            # ⚠️ 回调里绝对不能 print / 写文件 / 拿锁。
+            #    stderr 是管道，一旦对端读得慢、写阻塞，
+            #    PortAudio 的回调线程就永久卡死 —— 麦克风从此哑掉，
+            #    主循环则死等 aq.get()。实测就是这样整个服务假死的：
+            #      Thread-4 (_run_loop) → Queue.get() 永远不返回
+            #    状态只记在变量里，由主循环负责打出来。
             if status:
-                print(f"  [音频] {status}", file=sys.stderr)
+                last_status[0] = str(status)
             aq.put(indata.copy())
 
+        last_frame = time.monotonic()
         try:
             with sd.InputStream(samplerate=self.sample_rate, channels=1,
                                 dtype="float32", blocksize=block,
                                 device=self.device, callback=cb):
                 while True:
-                    frame = aq.get().flatten()
+                    try:
+                        # 带超时地等帧：回调死了也不能把主循环一起拖死
+                        frame = aq.get(timeout=1.0).flatten()
+                    except queue.Empty:
+                        if time.monotonic() - last_frame > STREAM_STALL_SECONDS:
+                            print(f"\n  ⚠️ 麦克风 {STREAM_STALL_SECONDS:g} 秒没数据，"
+                                  "重启音频流", flush=True)
+                            raise AudioStalled("音频回调停止供帧")
+                        continue
+
+                    last_frame = time.monotonic()
+                    if last_status[0]:
+                        print(f"  [音频] {last_status[0]}", file=sys.stderr, flush=True)
+                        last_status[0] = ""
                     self._tick(frame)
         except KeyboardInterrupt:
             print(f"\n\n=== 共识别 {len(self.transcripts)} 句 ===")

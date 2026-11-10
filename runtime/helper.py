@@ -32,6 +32,24 @@ except ImportError:
 
 PROTOCOL_VERSION = 1
 STATES = {"IDLE", "THINKING", "WORKING", "WAITING", "SUCCESS", "ERROR", "DISCONNECTED"}
+
+# 语音音色：右键菜单里可选。顺序 = 菜单顺序，按音高从高到低。
+# 只在这里列名字，真正的合成由插件转给语音服务（voiceTts 配置）。
+VOICE_OPTIONS: list[tuple[str, str]] = [
+    ("Bella", "萝莉音 · 最可爱"),
+    ("Momo", "萝莉音 · 软糯"),
+    ("Mia", "少女音 · 清亮"),
+    ("Kiki", "少女音 · 俏皮"),
+    ("Cherry", "少女音 · 甜美"),
+    ("Serena", "少女音 · 温柔"),
+    ("Chelsie", "少女音 · 活泼"),
+    ("Sunny", "元气女声"),
+    ("Jada", "高音女声"),
+    ("Katerina", "御姐音"),
+    ("Ethan", "男声 · 低沉"),
+    ("Peter", "男声 · 沉稳"),
+]
+DEFAULT_VOICE = "Bella"
 # A decoded 412x344 ARGB32 frame costs ~0.55 MB, so keeping every frame of a
 # 24 fps set resident would need well over a gigabyte. Frames are read from disk
 # once as compressed bytes and decoded through a bounded cache instead.
@@ -347,6 +365,13 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                 else {"SUCCESS", "ERROR"}
             )
             self.activity_level = os.environ.get("DSH_DAFEIYU_ACTIVITY_LEVEL", "normal")
+            # 音色：环境变量优先，其次上次保存的选择，最后默认
+            configured_voice = os.environ.get("DSH_DAFEIYU_VOICE")
+            self.voice = (
+                configured_voice.strip()
+                if configured_voice and configured_voice.strip()
+                else self.layout.get("voice", DEFAULT_VOICE)
+            )
             configured_bubble_mode = os.environ.get("DSH_DAFEIYU_BUBBLE_MODE")
             self.bubble_mode = (
                 configured_bubble_mode
@@ -806,6 +831,7 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
                 "reducedMotion": self.reduced_motion,
                 "bubbleMode": self.bubble_mode,
                 "bubbleStates": self.bubble_states,
+                "voice": self.voice,
             }
             try:
                 save_layout(self.layout_path, self.layout)
@@ -1187,12 +1213,26 @@ def run_visual(recorder: EventRecorder, snapshot_path: Path | None = None) -> in
             reduced_action = menu.addAction("减少动态")
             reduced_action.setCheckable(True)
             reduced_action.setChecked(self.reduced_motion)
+            # ── 音色 ──────────────────────────────────────────────
+            # 选完只做两件事：本地记住（打勾用）+ 发一条 settings 消息，
+            # 由插件转给语音服务做热切换。helper 自己不出声，所以很快。
+            voice_menu = menu.addMenu("音色")
+            voice_actions = {}
+            for code, label in VOICE_OPTIONS:
+                action = voice_menu.addAction(label)
+                action.setCheckable(True)
+                action.setChecked(self.voice == code)
+                voice_actions[action] = code
             open_webui_action = menu.addAction(self.open_label)
             menu.addSeparator()
             hide_action = menu.addAction("本次隐藏")
             exit_action = menu.addAction("本次关闭")
             selected = menu.exec(event.globalPos())
-            if selected in size_actions:
+            if selected in voice_actions:
+                self.voice = voice_actions[selected]
+                self._save_layout()
+                emit_reply("settings", voice=self.voice)
+            elif selected in size_actions:
                 self.scale = size_actions[selected]
                 self._apply_window_size()
                 self._move_to_pet(self.pet_x, self.pet_y)

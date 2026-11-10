@@ -20,6 +20,8 @@ DEFAULT_LAYOUT: dict[str, Any] = {
     "reducedMotion": False,
     "bubbleMode": "always",
     "bubbleStates": ["SUCCESS", "ERROR", "WAITING"],
+    # 语音音色：只用来在右键菜单里打勾，真正切换由插件转给语音服务
+    "voice": "Bella",
 }
 
 
@@ -59,6 +61,9 @@ def normalise_layout(value: Any) -> dict[str, Any]:
         layout["bubbleMode"] = value["bubbleMode"]
     if isinstance(value.get("bubbleStates"), list):
         layout["bubbleStates"] = [str(state) for state in value["bubbleStates"] if isinstance(state, str)]
+    voice = value.get("voice")
+    if isinstance(voice, str) and voice.strip():
+        layout["voice"] = voice.strip()[:32]
     return layout
 
 

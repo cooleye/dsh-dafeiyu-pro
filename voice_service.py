@@ -149,20 +149,24 @@ class VoiceService:
 
     def update_config(self, patch: dict) -> None:
         patch = patch or {}
-        self.config.update(patch)
+        # 只处理真的变了的键，否则每次设置页动一下都会刷一堆「要重启」
+        changed = {k: v for k, v in patch.items() if self.config.get(k) != v}
+        if not changed:
+            return
+        self.config.update(changed)
 
         applied: list[str] = []
 
         # 音色可以热改：Speaker 只换一个字段，下一句就生效
-        if "voice" in patch and self.assistant is not None:
+        if "voice" in changed and self.assistant is not None:
             try:
-                self.assistant.set_voice(patch["voice"])
+                self.assistant.set_voice(changed["voice"])
                 applied.append("voice")
             except Exception as e:
                 self.ev.error(f"换音色失败：{e}")
 
         # 其它项（设备、模型等）要重建 Assistant
-        rest = [k for k in patch if k not in applied]
+        rest = [k for k in changed if k not in applied]
         if rest:
             self.ev.log(f"这些要重启才生效：{rest}")
 

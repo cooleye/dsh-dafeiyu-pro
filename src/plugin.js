@@ -68,20 +68,19 @@ export const Config = Schema.object({
   voiceEnabled: Schema.boolean().default(false).description('启用语音对话（唤醒词、听说）'),
   voiceWakeWord: Schema.string().default('大肥鱼').description('唤醒词（需与 kws-model/keywords.txt 一致）'),
   voiceTts: Schema.union([
-    Schema.const('Cherry').description('Cherry · 甜美女声（默认）'),
-    Schema.const('Serena').description('Serena · 温柔女声'),
-    Schema.const('Chelsie').description('Chelsie · 活泼女声'),
-    Schema.const('Jada').description('Jada · 成熟女声'),
-    Schema.const('Sunny').description('Sunny · 明亮女声'),
-    Schema.const('Katerina').description('Katerina · 御姐女声'),
-    Schema.const('Ethan').description('Ethan · 阳光男声'),
-    Schema.const('Dylan').description('Dylan · 少年男声'),
-    Schema.const('Peter').description('Peter · 沉稳男声'),
-    Schema.const('Aiden').description('Aiden · 磁性男声'),
-    Schema.const('Ryan').description('Ryan · 播报男声'),
-    Schema.const('Elias').description('Elias · 低音男声'),
-    Schema.const('Nofish').description('Nofish · 特色音色'),
-  ]).default('Cherry').description('TTS 音色（改完下一句就生效，不用重启）'),
+    Schema.const('Bella').description('Bella · 萝莉音（最可爱，默认）'),
+    Schema.const('Momo').description('Momo · 萝莉音（软糯）'),
+    Schema.const('Mia').description('Mia · 少女音（清亮）'),
+    Schema.const('Kiki').description('Kiki · 少女音（俏皮）'),
+    Schema.const('Cherry').description('Cherry · 少女音（甜美）'),
+    Schema.const('Serena').description('Serena · 少女音（温柔）'),
+    Schema.const('Chelsie').description('Chelsie · 少女音（活泼）'),
+    Schema.const('Sunny').description('Sunny · 元气女声'),
+    Schema.const('Jada').description('Jada · 高音女声'),
+    Schema.const('Katerina').description('Katerina · 御姐音（低沉）'),
+    Schema.const('Ethan').description('Ethan · 男声（低沉）'),
+    Schema.const('Peter').description('Peter · 男声（沉稳）'),
+  ]).default('Bella').description('TTS 音色（改完下一句就生效，不用重启）'),
   voiceLlm: Schema.string().default('qwen-flash').description('对话模型'),
   voiceAgent: Schema.boolean().default(true).description('长任务交给 DSH agent 执行'),
   voiceAskPermission: Schema.boolean().default(true).description('写工作区外文件前先语音确认'),
@@ -116,7 +115,7 @@ const defaults = Object.freeze({
   // 语音（本 fork）
   voiceEnabled: false,
   voiceWakeWord: '大肥鱼',
-  voiceTts: 'Cherry',
+  voiceTts: 'Bella',
   voiceLlm: 'qwen-flash',
   voiceAgent: true,
   voiceAskPermission: true,
@@ -426,6 +425,8 @@ function mountCompanion(ctx, config = {}, eventCtx = ctx, logger) {
     DSH_DAFEIYU_BUBBLE_SCALE: String(resolved.bubbleScale ?? defaults.bubbleScale),
     DSH_DAFEIYU_ACTIVITY_LEVEL: String(resolved.activityLevel ?? defaults.activityLevel),
     DSH_DAFEIYU_REDUCED_MOTION: resolved.reducedMotion === true ? '1' : '0',
+    // 音色：让右键菜单知道该在哪一项打勾
+    DSH_DAFEIYU_VOICE: String(resolved.voiceTts ?? defaults.voiceTts),
     DSH_DAFEIYU_SOUND_ENABLED: resolved.soundEnabled !== false ? '1' : '0',
     DSH_DAFEIYU_SOUND_STATES: normalizeSoundStates(resolved.soundStates).join(','),
     DSH_DAFEIYU_BUBBLE_MODE: String(resolved.bubbleMode ?? defaults.bubbleMode),
@@ -478,6 +479,10 @@ function mountCompanion(ctx, config = {}, eventCtx = ctx, logger) {
         if (Number.isFinite(report.scale)) patch.scale = Math.min(1.4, Math.max(0.55, report.scale))
         if (Number.isFinite(report.bubbleScale)) patch.bubbleScale = Math.min(1.2, Math.max(0.8, report.bubbleScale))
         if (typeof report.reducedMotion === 'boolean') patch.reducedMotion = report.reducedMotion
+        // 右键菜单选的音色 → 写进设置 → settings.watch 会热推给语音服务
+        if (typeof report.voice === 'string' && report.voice.trim()) {
+          patch.voiceTts = report.voice.trim().slice(0, 32)
+        }
         if (Object.keys(patch).length === 0) return
         // Capture the host values before the write: the fallback only applies
         // while the host still holds the same baseline.
@@ -623,7 +628,7 @@ function mountCompanion(ctx, config = {}, eventCtx = ctx, logger) {
 
   function voiceConfigOf(next) {
     return {
-      voice: next.voiceTts || 'Cherry',
+      voice: next.voiceTts || 'Bella',
       llmModel: next.voiceLlm || 'qwen-flash',
       useAgent: next.voiceAgent !== false,
       askPermission: next.voiceAskPermission !== false,

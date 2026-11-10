@@ -150,40 +150,46 @@ python phase4_assistant.py --audio-mode exclusive
 
 ### 能换哪些
 
-`qwen3-tts-flash` 实测可用 13 个音色：
+`qwen3-tts-flash` 实测可用 12 个音色（按音高从高到低，女声为主）：
 
-| 音色 | 风格 | 说明 |
-|---|---|---|
-| **Cherry** | 甜美女声 | **默认**，偏软萌 |
-| Serena | 温柔女声 | 柔和，适合深夜 |
-| Chelsie | 活泼女声 | 跳脱一点 |
-| Jada | 成熟女声 | 偏御姐 |
-| Sunny | 明亮女声 | 元气 |
-| Katerina | 御姐女声 | 低沉有气场 |
-| Ethan | 阳光男声 | 少年感 |
-| Dylan | 少年男声 | 年轻 |
-| Peter | 沉稳男声 | 可靠 |
-| Aiden | 磁性男声 | 低沉 |
-| Ryan | 播报男声 | 像新闻主播 |
-| Elias | 低音男声 | 很沉 |
-| Nofish | 特色音色 | 有点怪，试听一下 |
+| 音色 | 风格 | 说明 | 实测基频 |
+|---|---|---|---|
+| **Bella** | **萝莉音** | **默认**，最可爱 | 364 Hz |
+| Momo | 萝莉音 | 软糯 | 343 Hz |
+| Mia | 少女音 | 清亮 | 289 Hz |
+| Kiki | 少女音 | 俏皮 | 276 Hz |
+| Cherry | 少女音 | 甜美 | 242 Hz |
+| Serena | 少女音 | 温柔 | 238 Hz |
+| Chelsie | 少女音 | 活泼 | 242 Hz |
+| Sunny | 元气女声 | 明亮 | 286 Hz |
+| Jada | 高音女声 | 很尖 | 400 Hz |
+| Katerina | 御姐音 | 低沉有气场 | 225 Hz |
+| Ethan | 男声 | 低沉 | 137 Hz |
+| Peter | 男声 | 沉稳 | 197 Hz |
 
-### 怎么换（两个办法）
+> 基频是本鱼用自相关算法实测的中位数，越高越接近童声。
+> Bella 364Hz 是目前最「萝莉」的一个。
 
-**办法一：设置页下拉框（推荐）**
+### 怎么换（三个办法）
+
+**办法一：桌宠右键菜单（最快）**
+
+在桌宠身上点右键 → **音色** → 选一个。
+
+选完立即生效，不用重启。
+
+**办法二：设置页下拉框**
 
 ```
 设置 → 插件 → dsh-dafeiyu-pro → TTS 音色  ▾
 ```
 
-选完**下一句就生效，不用重启**。
-
-**办法二：命令行热改**
+**办法三：命令行热改**
 
 ```powershell
 $u = 'http://127.0.0.1:1752/plugins/dsh-dafeiyu/config'
 Invoke-WebRequest -Uri $u -Method Patch -UseBasicParsing `
-  -Body (@{voiceTts='Serena'} | ConvertTo-Json) -ContentType 'application/json'
+  -Body (@{voiceTts='Momo'} | ConvertTo-Json) -ContentType 'application/json'
 ```
 
 ### 先试听再选
@@ -193,7 +199,7 @@ cd D:\project\dsh-dafeiyu-pro
 $env:PYTHONIOENCODING='utf-8'
 
 python preview_voices.py                 # 全部念一遍（约 30 秒）
-python preview_voices.py --voice Serena  # 只听一个
+python preview_voices.py --voice Bella   # 只听一个
 python preview_voices.py --save          # 存成 wav 不播放
 ```
 
@@ -203,6 +209,24 @@ python preview_voices.py --save          # 存成 wav 不播放
 不动正在念的那句（半句换声音会很怪）。
 
 其它配置（音频设备、对话模型、agent 开关）还是要重启语音服务才生效。
+
+### 右键菜单是怎么接起来的
+
+```
+helper.py 右键菜单选中音色
+    ↓ emit_reply("settings", voice="Momo")
+helper-process.js 转成 onSettingsChange
+    ↓
+plugin.js 写成 settings.voiceTts
+    ↓ settings.watch 触发
+voice.updateConfig({voice:"Momo"})
+    ↓
+voice_service.py → Assistant.set_voice()
+    ↓
+下一句就用新音色
+```
+
+helper 自己不出声，只发一条消息，所以菜单响应很快。
 
 ---
 

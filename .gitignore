@@ -34,3 +34,8 @@ kws-model/
 samples/
 test-*.wav
 
+# DSH agent 干活时写出来的东西（不是项目代码，别进仓库）
+agent-out/
+output/
+*.output.md
+

@@ -26,11 +26,16 @@
 from __future__ import annotations
 
 import argparse
+import array
+import hashlib
+import io
+import os
 import queue
 import re
 import sys
 import threading
 import time
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -68,6 +73,17 @@ BARGE_IN_RMS = 0.045
 BARGE_IN_FRAMES = 2
 # 开口后这段时间内不判断（播放起音 + 自身回传最响的一段）
 BARGE_IN_GRACE_MS = 300
+
+# ---------- 固定短句缓存 ----------
+# 「我在」「好，那我退下了」这种固定话术，用云端合成一次存成 WAV，
+# 以后直接读盘播放 —— 音色和正文一致，延迟接近 0，成本只花一次。
+#
+# 为什么不用本地 SAPI：音色完全不一样（微软 Huihui vs 你选的 Bella），
+# 唤醒那一下就换了个人的声音，体验很割裂。
+FIXED_CACHE_DIR = Path(
+    os.environ.get("DSH_DAFEIYU_VOICE_CACHE")
+    or str(Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "dsh-dafeiyu" / "voice-cache")
+)
 
 
 def split_long(text: str, limit: int = MAX_BUFFER_CHARS) -> tuple[str, str]:
@@ -113,7 +129,120 @@ class Speaker:
         """排入一句要念的话。"""
         text = (text or "").strip()
         if text:
-            self.q.put(text)
+            self.q.put(("text", text))
+
+    def say_audio(self, pcm, rate: int) -> None:
+        """排入一段已经合成好的音频（跳过合成）。"""
+        self.q.put(("pcm", pcm, rate))
+
+    # ---------- 固定短句缓存 ----------
+
+    def _cache_path(self, text: str) -> Path:
+        """缓存文件名 = 音色 + 文本的哈希。
+
+        带上音色：换声音之后缓存自动失效，不会拿旧音色的音频凑数。
+        """
+        key = f"{self.voice}\u0000{text}".encode("utf-8")
+        digest = hashlib.sha256(key).hexdigest()[:20]
+        return FIXED_CACHE_DIR / f"{digest}.wav"
+
+    def cached_pcm(self, text: str, allow_synthesize: bool = True):
+        """取固定短句的音频，返回 (pcm, rate)；拿不到返回 None。
+
+        先查磁盘缓存；没有就合成一次并存盘。之后都是读盘，几乎零延迟。
+        """
+        text = (text or "").strip()
+        if not text:
+            return None
+        path = self._cache_path(text)
+
+        # 1) 磁盘命中
+        if path.exists():
+            try:
+                return self._read_wav_file(path)
+            except Exception:
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
+
+        if not allow_synthesize:
+            return None
+
+        # 2) 合成一次并落盘
+        try:
+            wav = synthesize(text, self.api_key, self.voice)
+        except TTSError:
+            return None
+        try:
+            FIXED_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(wav)
+        except Exception:
+            pass
+        try:
+            return wav_to_pcm(wav)
+        except Exception:
+            return None
+
+    @staticmethod
+    def _read_wav_file(path: Path):
+        """读 WAV 文件，返回 (float32 采样, 采样率)。
+
+        ⚠️ 不能直接用 `readframes(w.getnframes())`：
+        Qwen TTS 返回的 WAV 头里 data 长度是个占位值，
+        getnframes() 会报 10 亿多 —— 按它去读会申请 2GB 缓冲，
+        实测每次卡 500ms 以上。
+
+        这里先读全部字节，再按「文件实际剩下多少」夹一下，
+        用 `readframes(-1)` 读到底（wave 会读到 data 块结束）。
+        """
+        raw = path.read_bytes()
+        buf = io.BytesIO(raw)
+        with wave.open(buf, "rb") as w:
+            ch = w.getnchannels()
+            rate = w.getframerate()
+            width = w.getsampwidth()
+            declared = w.getnframes()
+            # 按真实字节数算一个上限，防止头里撒谎
+            plausible = max(1, (len(raw) - 44) // max(1, ch * width))
+            if declared <= 0 or declared > plausible:
+                data = w.readframes(-1)      # 读到 data 块实际结束
+            else:
+                data = w.readframes(declared)
+
+        a = array.array("h")
+        a.frombytes(data)
+        if ch > 1:
+            a = a[::ch]
+        return np.array(a, dtype=np.float32) / 32768.0, rate
+
+    def say_fixed(self, text: str) -> bool:
+        """念一句固定话术（优先缓存，其次现场合成）。
+
+        返回 False 表示云端彻底拿不到 —— 调用方可以退回本地 SAPI 兜底。
+        """
+        got = self.cached_pcm(text)
+        if not got:
+            return False
+        pcm, rate = got
+        self.say_audio(pcm, rate)
+        return True
+
+    def prewarm(self, phrases) -> None:
+        """后台把这些固定话术合成好存起来，让第一次也是秒出。
+
+        首次启动时做一次，之后基本只花网络时间；换音色后会重新预热。
+        """
+        def run():
+            for text in phrases:
+                if not text:
+                    continue
+                try:
+                    self.cached_pcm(text)
+                except Exception:
+                    pass
+
+        threading.Thread(target=run, daemon=True).start()
 
     def stop(self) -> None:
         """立刻闭嘴（清空队列 + 停播放）。"""
@@ -146,11 +275,28 @@ class Speaker:
 
     def _run(self) -> None:
         while True:
-            text = self.q.get()
-            if text is None:
+            item = self.q.get()
+            if item is None:
                 return
             if self.stop_flag.is_set():
                 continue
+
+            kind = item[0] if isinstance(item, tuple) else "text"
+
+            # 已经合成好的音频：直接播，省一次网络往返
+            if kind == "pcm":
+                _, pcm, rate = item
+                self.busy = True
+                self.started_at = time.time()
+                try:
+                    self.player.play_pcm(pcm, rate)
+                except Exception as e:
+                    print(f"\n  ❌ 播放失败：{e}\n")
+                finally:
+                    self.busy = False
+                continue
+
+            text = item[1] if kind == "text" else str(item)
             self.busy = True
             self.started_at = time.time()
             self.said_chars += len(text)

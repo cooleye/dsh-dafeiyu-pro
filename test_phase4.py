@@ -30,6 +30,17 @@ class FakeSpeaker:
     def say(self, t):
         self.said.append(t)
 
+    def say_fixed(self, t):
+        """固定短句（唤醒/退下）：测试里当普通说话处理。"""
+        self.said.append(t)
+        return True
+
+    def say_audio(self, pcm, rate):
+        pass
+
+    def prewarm(self, phrases):
+        pass
+
     def stop(self):
         self.stopped += 1
         self.busy = False
@@ -90,6 +101,8 @@ class StubVoice:
     def __init__(self, *a, **kw):
         self.state = "awake"
         self.speaking = False
+        self.wake_reply = "我在"
+        self.on_wake_reply = None
         self.left = 0
 
     def _render_status(self, rms):
@@ -331,40 +344,47 @@ def t_farewell_detect() -> bool:
 
 
 def t_farewell_flow() -> bool:
-    """说「退下吧」→ 回到待命、不再说话。"""
-    spoken = []
-    with patch("phase4_assistant.sapi_speak", lambda t: spoken.append(t)):
-        app = make_app()
-        app.active = True
-        app._on_user_said("退下吧")
-        left = app.loop.left
-        active = app.active
-        said = list(spoken)
+    """说「退下吧」→ 回到待命、不再说话。
 
-    ok = (left == 1 and active is False and any("退下" in s for s in said))
+    退下那句话现在也走云端音色（缓存过是秒出），
+    所以断言落在 speaker 队列上，不再是本地 SAPI。
+    """
+    from phase4_assistant import FAREWELL_REPLY
+
+    app = make_app()
+    app.active = True
+    app._on_user_said("退下吧")
+    left = app.loop.left
+    active = app.active
+    said = list(app.speaker.said)
+
+    ok = (left == 1 and active is False and FAREWELL_REPLY in said)
     print(f"\n[退下流程]  {'✅' if ok else '❌'}")
-    print(f"  回待命次数={left}  active={active}  本地念={said}")
+    print(f"  回待命次数={left}  active={active}  念了={said}")
     return ok
 
 
 def t_farewell_silences_late_reply() -> bool:
     """退下之后，LLM 晚产出也不该再说话。"""
+    from phase4_assistant import FAREWELL_REPLY
+
     app = make_app()
     app.active = True
     app._say("先说话")           # 这会进队列
     before = len(app.speaker.said)
 
-    with patch("phase4_assistant.sapi_speak", lambda t: None):
-        app._on_user_said("退下吧")
+    app._on_user_said("退下吧")
 
     # 退下后 LLM 线程迟到的产出
     app.thinking = True
     app._say("迟到的回复")
 
-    after = len(app.speaker.said)
-    ok = after == before      # 迟到的那句不该进去
+    said = app.speaker.said
+    added = said[before:]
+    ok = (len(added) == 1 and added[0] == FAREWELL_REPLY
+          and "迟到的回复" not in said)
     print(f"\n[退下后静音]  {'✅' if ok else '❌'}")
-    print(f"  退下前队列={before} 退下后={after}（应相等）")
+    print(f"  退下后新增={added}（应只有告别语）")
     return ok
 
 

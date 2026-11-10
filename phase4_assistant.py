@@ -233,6 +233,12 @@ class Assistant:
             audio_mode=audio_mode,
         )
         self.loop.on_voice_level = self._check_barge_in
+        # 唤醒回应也走云端音色（缓存过就是秒出），避免和正文音色不一致
+        self.loop.on_wake_reply = self._speak_fixed
+
+        # 预热固定短句：唤醒「我在」+ 退下「好，那我退下了」
+        # 首次要网络合成一次，之后都是读磁盘，几乎零延迟
+        self.speaker.prewarm([self.loop.wake_reply, FAREWELL_REPLY])
         self.loop._render_status = self._render
 
     # ---------- 打断 ----------
@@ -362,6 +368,14 @@ class Assistant:
 
     # ---------- 退下 ----------
 
+    def _speak_fixed(self, text: str) -> bool:
+        """念一句固定话术（唤醒/退下用）。
+
+        优先走云端音色 + 磁盘缓存 —— 这样和正文的声音完全一致，
+        缓存命中时延迟接近 0。返回 False 让调用方退回本地 SAPI。
+        """
+        return self.speaker.say_fixed(text)
+
     def _say(self, text: str) -> None:
         """往播放队列塞一句话。
 
@@ -402,7 +416,9 @@ class Assistant:
 
         self.ev.state("idle")
         self.ev.log(f"🔊 「{FAREWELL_REPLY}」")
-        sapi_speak(FAREWELL_REPLY)
+        # 用云端同音色念（缓存过就是秒出）；彻底拿不到才退回本地 SAPI
+        if not self.speaker.say_fixed(FAREWELL_REPLY):
+            sapi_speak(FAREWELL_REPLY)
 
         # 回到待命：关 ASR、停 VAD、等下次唤醒
         self.loop._leave_awake()

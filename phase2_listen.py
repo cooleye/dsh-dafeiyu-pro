@@ -89,6 +89,9 @@ class VoiceLoop:
         self.dialogue_timeout = dialogue_timeout
         # 识别出一句就回调（Phase 3 用它接 LLM）
         self.on_transcript = on_transcript
+        # 唤醒回应怎么说。默认走本地 SAPI（快、不依赖网络），
+        # 但那样音色和正文不一致；Phase 4 会换成「云端音色 + 磁盘缓存」。
+        self.on_wake_reply = None
         # 每帧上报音量（用于「它说话时你一开口就打断」）
         # 注意：这不是 VAD，是「立即反应」——不等识别完
         self.on_voice_level = None
@@ -258,7 +261,15 @@ class VoiceLoop:
 
         print(f"\n\n  🎯 唤醒：{keyword}")
         print(f"  🔊 「{self.wake_reply}」")
-        sapi_speak(self.wake_reply)
+        # 有外部处理器就用它（Phase 4 走云端音色 + 缓存），否则本地 SAPI
+        handled = False
+        if self.on_wake_reply is not None:
+            try:
+                handled = bool(self.on_wake_reply(self.wake_reply))
+            except Exception as e:
+                print(f"  ⚠️ 云端回应失败，退回本地：{e}")
+        if not handled:
+            sapi_speak(self.wake_reply)
         print("  👂 在听...\n")
 
     # ---------- 对话态：VAD 断句 + ASR ----------

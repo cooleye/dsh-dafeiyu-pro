@@ -745,20 +745,57 @@ desk-ai 的打断阈值 0.035 是**建立在浏览器 AEC 之上**的：
 
 ## 10. 路线图
 
-### Phase 0 · 唤醒 PoC（**最快见效**）
+### Phase 0 · 唤醒 PoC（**已完成 ✅**）
 
 **目标**：叫「大肥鱼」→ 气泡有反应
 
-**工作**：
-- 复制 desk-ai 的 KWS 模型到 `%LOCALAPPDATA%\dsh-dafeiyu\kws\`
-- 用 `sherpa-onnx` Python 包加载
-- 写 `keywords.txt`：`d à f éi y ú @大肥鱼`
-- 麦克风 → KWS → 打印命中
-- 实测唤醒率
+**实测结果**：
 
-**关键**：DLL 预加载（§8.1）
+| 项目 | 结果 |
+|---|---|
+| 模型 | sherpa-onnx KWS（zipformer-wenetspeech-3.3M） |
+| 模型体积 | 4.8 MB |
+| 唤醒词 | `d à f éi y ú @大肥鱼` |
+| **首次实测** | **3 次全中** ✅ |
+| 参数 | score=3.0 / threshold=0.1（沿用 desk-ai 验证值） |
+| 采样率 | 设备 48k → 重采样 16k |
+| 录音后端 | **WDM-KS**（其他三个后端都被占用） |
 
-**估时**：半天（原来是 1–2 天，因为模型现成）
+**踩坑记录**：
+
+1. **sherpa-onnx 2.0 的 Python API 变了**
+   文档还是 1.x 的写法（`KeywordSpotterConfig` 对象），2.0 改成了扁平参数：
+   ```python
+   # 2.0 实际写法
+   sherpa_onnx.KeywordSpotter(tokens=..., encoder=..., decoder=...,
+                              joiner=..., keywords_file=...,
+                              keywords_score=3.0, keywords_threshold=0.1)
+   ```
+
+2. **麦克风被独占（Windows）**
+   四个音频后端实测：
+
+   | 后端 | 结果 |
+   |---|---|
+   | MME | ❌ PortAudioError -9999 |
+   | Windows DirectSound | ❌ 同上 |
+   | Windows WASAPI | ❌ 同上 |
+   | **Windows WDM-KS** | ✅ **成功** |
+
+   WDM-KS 是内核流，绕开系统混音器，所以不被别的程序独占。
+   **对策**：按 WDM-KS → WASAPI → DirectSound → MME 顺序自动降级。
+
+3. **声卡默认不是 16k**
+   绝大多数设备是 44.1k / 48k，模型要 16k。desk-ai 在浏览器里靠 Web Audio
+   自动重采样，我们这边必须自己做。
+
+**产出**：
+- `phase0_kws_poc.py` —— 自检 / 实时监听 / WAV 测试 / 批量评估
+- `collect_samples.py` —— 采集正负样本
+- `record_wav.py` —— 单次录音
+
+**下一步**：采集负样本，测假阳性率。只看「三次都命中」不够，
+还要知道「该不该叫都叫」的比例。
 
 ---
 

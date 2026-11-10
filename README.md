@@ -78,12 +78,24 @@
 | 阶段 | 内容 | 状态 |
 |---|---|---|
 | — | Fork 上游代码 | ✅ 完成 |
-| Phase 0 | 唤醒词 PoC | 🔨 进行中 |
+| Phase 0 | 唤醒词 PoC | ✅ **完成**（实测 3/3 命中） |
 | Phase 1 | 音频栈 + 本地出声 | ⬜ 未开始 |
 | Phase 2 | 云端流式 ASR | ⬜ 未开始 |
 | Phase 3 | 意图分流 + 直连 LLM | ⬜ 未开始 |
 | Phase 4 | 接入 DSH agent | ⬜ 未开始 |
 | Phase 5 | 长期记忆 | ⬜ 未开始 |
+
+### Phase 0 已验证
+
+```
+唤醒词：d à f éi y ú @大肥鱼
+模型  ：sherpa-onnx KWS zipformer-wenetspeech-3.3M（4.8 MB）
+实测  ：3 次唤醒，3 次命中
+```
+
+**重要发现**：Windows 上 MME / DirectSound / WASAPI 三个后端都可能被
+别的程序独占（比如 DSH 自己的语音输入），只有 **WDM-KS** 能稳定打开。
+本项目已做自动降级。
 
 详细设计见 [docs/VOICE-DESIGN.md](docs/VOICE-DESIGN.md)。
 

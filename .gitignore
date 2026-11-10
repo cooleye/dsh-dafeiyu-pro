@@ -31,4 +31,6 @@ Thumbs.db
 # 本项目专属：语音模块的本地缓存
 .voice-cache/
 kws-model/
+samples/
+test-*.wav
 

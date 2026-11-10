@@ -83,6 +83,9 @@ class VoiceLoop:
         self.dialogue_timeout = dialogue_timeout
         # 识别出一句就回调（Phase 3 用它接 LLM）
         self.on_transcript = on_transcript
+        # 每帧上报音量（用于「它说话时你一开口就打断」）
+        # 注意：这不是 VAD，是「立即反应」——不等识别完
+        self.on_voice_level = None
 
         # KWS
         self.spotter, self.kws_stream = create_spotter(
@@ -108,6 +111,15 @@ class VoiceLoop:
         # 会话代数：每开一段 +1。建连是异步的，完成时如果代数变了，
         # 说明这段已经翻篇了，新连接直接丢掉，避免连接泄漏。
         self.asr_gen = 0
+
+        # 建连失败退避：连续失败时拉长间隔，避免把服务打爆
+        self._asr_fail_count = 0
+        self._asr_cooldown_until = 0.0
+
+        # 攒够几帧才建连（避免咳一声就开一条 WebSocket）
+        self.min_frames_before_connect = 3
+        # 本段是否已经发起过建连（防同一段重复建）
+        self.pending_pcm_started = False
 
         # 录音缓冲
         self.seg_buf: list[np.ndarray] = []
@@ -156,6 +168,15 @@ class VoiceLoop:
         rms = float(np.sqrt(np.mean(frame ** 2)))
         self._render_status(rms)
 
+        # ⭐ 每帧上报音量，给「打断」用。
+        #    打断必须在这一层做：等 ASR 出结果再停，要慢 1~2 秒，
+        #    体验上就是「打断不灵」。
+        if self.on_voice_level:
+            try:
+                self.on_voice_level(rms)
+            except Exception:
+                pass
+
         if self.state == "idle":
             self._tick_idle(frame)
         else:
@@ -185,6 +206,7 @@ class VoiceLoop:
         self.silence_ms = 0.0
         self.asr = None
         self.pending_pcm = []
+        self.pending_pcm_started = False
         self.asr_gen += 1
 
         print(f"\n\n  🎯 唤醒：{keyword}")
@@ -208,8 +230,6 @@ class VoiceLoop:
                 self.speaking = True
                 self.seg_start = now
                 self.seg_buf = []
-                # ⭐ 惰性建会话：真正开口时才连云端，待命时不占连接
-                self._start_asr_async()
             self.silence_ms = 0.0
         elif self.speaking:
             # 迟滞：说话中用更低的阈值判断是否还在说
@@ -221,6 +241,16 @@ class VoiceLoop:
         if self.speaking:
             self.seg_buf.append(frame)
             self.awake_until = now + self.dialogue_timeout
+
+            # ⭐ 攒够几帧再建连：
+            #    咳一声、碰一下麦克风都会触发 speaking，如果立刻建 WebSocket，
+            #    短促噪声多了会把连接打满（实测报 timed out）。
+            if (self.asr is None
+                    and not self.pending_pcm_started
+                    and len(self.seg_buf) >= self.min_frames_before_connect
+                    and time.time() >= self._asr_cooldown_until):
+                self.pending_pcm_started = True
+                self._start_asr_async()
 
             # ⭐ 边说边送 ASR —— 这样 partial 字幕能实时出来
             pcm = (np.clip(frame, -1, 1) * 32767).astype(np.int16).tobytes()
@@ -250,6 +280,7 @@ class VoiceLoop:
         self.speaking = False
         self.silence_ms = 0.0
         self.seg_buf = []
+        self.pending_pcm_started = False
 
         if seg_ms < MIN_SPEECH_MS:
             # 太短（咳嗽、碰麦）→ 丢掉这段
@@ -323,10 +354,20 @@ class VoiceLoop:
                 )
                 asr.start()
             except Exception as e:
-                print(f"\n  ❌ ASR 启动失败：{e}\n")
+                # 失败退避：连续失败时逐步拉长冷却，避免把服务打爆
+                self._asr_fail_count += 1
+                backoff = min(30.0, 2.0 * self._asr_fail_count)
+                self._asr_cooldown_until = time.time() + backoff
+                print(f"\n  ❌ ASR 启动失败：{e}")
+                print(f"     {backoff:.0f} 秒内不再重连\n")
                 if gen == self.asr_gen:
                     self.pending_pcm = []
+                    self.pending_pcm_started = False
                 return
+
+            # 成功了，清零失败计数
+            self._asr_fail_count = 0
+            self._asr_cooldown_until = 0.0
 
             # 建连期间这段已经翻篇 / 已退出对话态 → 丢掉这条连接
             if gen != self.asr_gen or self.state != "awake":
@@ -353,6 +394,7 @@ class VoiceLoop:
         self.speaking = False
         self.seg_buf = []
         self.pending_pcm = []
+        self.pending_pcm_started = False
         self.asr_gen += 1
         asr = self.asr
         self.asr = None

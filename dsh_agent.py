@@ -61,8 +61,16 @@ class DshAgent:
         self.on_progress = on_progress or (lambda msg: None)
         self._proc: subprocess.Popen | None = None
 
-    def run(self, task: str) -> tuple[bool, str]:
-        """执行任务，返回 (成功?, 输出文本)。阻塞。"""
+    def run(self, task: str, permission_mode: str = "workspace-write") -> tuple[bool, str]:
+        """执行任务，返回 (成功?, 输出文本)。阻塞。
+
+        permission_mode:
+            workspace-write  —— 默认，只能写工作区（安全）
+            danger-full-access —— 放开整台机器（写桌面必须用这个）
+            read-only        —— 只读
+
+        对应 DSH 的 DSH_PERMISSION_MODE 环境变量。
+        """
         task = (task or "").strip()
         if not task:
             return False, "任务为空"
@@ -71,8 +79,8 @@ class DshAgent:
         env = os.environ.copy()
         if self.api_key:
             env.setdefault("DEEPSEEK_API_KEY", self.api_key)
-            # headless 用 deepseek-official 路由；部分版本读这个变量
             env.setdefault("DEEPSEEK_OFFICIAL_API_KEY", self.api_key)
+        env["DSH_PERMISSION_MODE"] = permission_mode
 
         cmd = [dsh, "--profile", self.profile, task]
         self.on_progress("启动 DSH agent ...")
@@ -112,10 +120,10 @@ class DshAgent:
 
         return True, out
 
-    def run_async(self, task: str, on_done) -> None:
+    def run_async(self, task: str, on_done, permission_mode: str = "workspace-write") -> None:
         """后台跑，完成后回调 on_done(ok, text)。"""
         def worker():
-            ok, text = self.run(task)
+            ok, text = self.run(task, permission_mode=permission_mode)
             try:
                 on_done(ok, text)
             except Exception as e:

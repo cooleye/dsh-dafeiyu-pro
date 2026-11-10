@@ -23,23 +23,23 @@ sys.path.insert(0, str(HERE))
 class FakeSpeaker:
     def __init__(self, *a, **kw):
         self.said: list[str] = []
+        self.stopped = 0
+        self.busy = False
+        self.started_at = 0.0
 
     def say(self, t):
         self.said.append(t)
 
     def stop(self):
-        pass
+        self.stopped += 1
+        self.busy = False
 
     def reset(self):
         pass
 
     @property
     def speaking(self):
-        return False
-
-    @property
-    def busy(self):
-        return False
+        return self.busy
 
 
 class FakeLLM:
@@ -65,11 +65,13 @@ class FakeLLM:
 class FakeAgent:
     def __init__(self, *a, **kw):
         self.calls: list[str] = []
+        self.modes: list[str] = []
         self.delay = 0.05
         self.result = ("ok", "任务结果：这是干完活的产出。")
 
-    def run_async(self, task, on_done):
+    def run_async(self, task, on_done, permission_mode="workspace-write"):
         self.calls.append(task)
+        self.modes.append(permission_mode)
 
         def w():
             time.sleep(self.delay)
@@ -184,6 +186,89 @@ def t_no_agent() -> bool:
     return ok
 
 
+def t_permission_grant() -> bool:
+    """要写桌面的任务 → 先问 → 说「允许」→ 用完整权限跑。"""
+    app = make_app()
+    app._on_user_said("帮我写一首诗，保存到桌面")
+    asked = any("允许" in s for s in app.speaker.said)
+    pending = app._pending_task is not None
+    no_task_yet = len(app.agent.calls) == 0
+
+    app._on_user_said("允许")
+    wait_idle(app)
+    ran = len(app.agent.calls) == 1
+    mode = app.agent.modes[0] if app.agent.modes else ""
+
+    ok = asked and pending and no_task_yet and ran and mode == "danger-full-access"
+    print(f"\n[权限：允许]  {'✅' if ok else '❌'}")
+    print(f"  先问了吗={asked} 挂起={pending} 未提前跑={no_task_yet}")
+    print(f"  最终跑={ran} 权限={mode}")
+    return ok
+
+
+def t_permission_deny() -> bool:
+    """说「不要」→ 不执行。"""
+    app = make_app()
+    app._on_user_said("帮我写一首诗，保存到桌面")
+    app._on_user_said("不要")
+    wait_idle(app)
+    ok = len(app.agent.calls) == 0 and app._pending_task is None
+    print(f"\n[权限：拒绝]  {'✅' if ok else '❌'}")
+    print(f"  跑了 {len(app.agent.calls)} 次（应为 0）")
+    return ok
+
+
+def t_no_permission_needed() -> bool:
+    """普通任务（不写外部文件）→ 不该问，直接用沙箱跑。"""
+    app = make_app()
+    app._on_user_said("帮我写一个 Python 脚本")
+    wait_idle(app)
+    asked = any("允许" in s for s in app.speaker.said)
+    mode = app.agent.modes[0] if app.agent.modes else ""
+    ok = (not asked) and mode == "workspace-write"
+    print(f"\n[普通任务不问权限]  {'✅' if ok else '❌'}")
+    print(f"  问了吗={asked} 权限={mode}")
+    return ok
+
+
+def t_barge_in() -> bool:
+    """播放中检测到音量超阈值 → 立刻停。"""
+    from phase3_chat import BARGE_IN_FRAMES, BARGE_IN_GRACE_MS, BARGE_IN_RMS
+
+    app = make_app()
+    app.speaker.busy = True
+    # 模拟已经开始念了（超过起音保护期）
+    app.speaker.started_at = time.time() - (BARGE_IN_GRACE_MS + 100) / 1000
+
+    # 先来一帧小的（不该停）
+    app._check_barge_in(0.001)
+    not_stopped_small = app.speaker.stopped == 0
+
+    # 连续 BARGE_IN_FRAMES 帧超过阈值 → 应该停
+    for _ in range(BARGE_IN_FRAMES):
+        app._check_barge_in(BARGE_IN_RMS + 0.02)
+
+    ok = not_stopped_small and app.speaker.stopped == 1
+    print(f"\n[打断]  {'✅' if ok else '❌'}")
+    print(f"  小音量不停={not_stopped_small} 超阈值停止次数={app.speaker.stopped}")
+    return ok
+
+
+def t_barge_in_grace() -> bool:
+    """刚开口的起音保护期内，不该被打断（防自身回传）。"""
+    from phase3_chat import BARGE_IN_GRACE_MS
+
+    app = make_app()
+    app.speaker.busy = True
+    app.speaker.started_at = time.time()  # 刚开口
+
+    for _ in range(5):
+        app._check_barge_in(0.5)
+
+    ok = app.speaker.stopped == 0
+    print(f"\n[起音保护]  {'✅' if ok else '❌'}")
+    print(f"  保护期内停止次数={app.speaker.stopped}（应为 0）")
+    return ok
 def t_clean_speech() -> bool:
     """Markdown 清洗。"""
     from phase4_assistant import clean_for_speech
@@ -246,6 +331,11 @@ def main() -> int:
         t_route_task(),
         t_stall_second(),
         t_no_agent(),
+        t_permission_grant(),
+        t_permission_deny(),
+        t_no_permission_needed(),
+        t_barge_in(),
+        t_barge_in_grace(),
         t_clean_speech(),
         t_truncate(),
     ]

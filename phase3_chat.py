@@ -53,6 +53,22 @@ MAX_BUFFER_CHARS = 40
 # 长句硬切时优先在这些地方断，念起来更自然
 SOFT_BREAK = "，、,：: "
 
+# ---------- 打断（barge-in）参数 ----------
+# 判定依据：播放期间麦克风音量。
+#
+# 为什么用音量而不是 VAD+ASR：
+#   等 ASR 出结果再停要 1~2 秒，用户感受就是「打断不灵」。
+#   音量判定是每帧（100ms）都看，能做到 200ms 内闭嘴。
+#
+# ⚠️ 我们没有 AEC（回声消除），播放的声音会漏进麦克风。
+#   Qt + sounddevice 拿不到浏览器的 echoCancellation。
+#   所以阈值必须比「自身回传」高、比「正常说话」低。
+BARGE_IN_RMS = 0.045
+# 连续几帧超过阈值才算（防单帧爆音误触发）
+BARGE_IN_FRAMES = 2
+# 开口后这段时间内不判断（播放起音 + 自身回传最响的一段）
+BARGE_IN_GRACE_MS = 300
+
 
 def split_long(text: str, limit: int = MAX_BUFFER_CHARS) -> tuple[str, str]:
     """把过长的文本切出一段（不超过 limit），返回 (head, tail)。
@@ -88,6 +104,8 @@ class Speaker:
         self.q: queue.Queue = queue.Queue()
         self.stop_flag = threading.Event()
         self.busy = False            # 正在说话（给打断检测用）
+        self.started_at = 0.0        # 本轮开口的时刻（打断时要跳过起音段）
+        self.said_chars = 0          # 累计念了多少字（诊断用）
         self._worker = threading.Thread(target=self._run, daemon=True)
         self._worker.start()
 
@@ -123,8 +141,12 @@ class Speaker:
             if self.stop_flag.is_set():
                 continue
             self.busy = True
+            self.started_at = time.time()
+            self.said_chars += len(text)
             try:
-                wav = synthesize(text, self.api_key, self.voice)
+                wav = self._synth_with_retry(text)
+                if wav is None:
+                    continue
                 pcm, rate = wav_to_pcm(wav)
                 self.player.play_pcm(pcm, rate)
             except TTSError as e:
@@ -133,6 +155,25 @@ class Speaker:
                 print(f"\n  ❌ 播放失败：{e}\n")
             finally:
                 self.busy = False
+
+    def _synth_with_retry(self, text: str, attempts: int = 2):
+        """合成，失败重试一次。
+
+        实测会遇到 read timeout（网络抖动 / 服务端偶发慢），
+        重试一次基本都能过；两次都失败才放弃。
+        """
+        last = None
+        for i in range(attempts):
+            if self.stop_flag.is_set():
+                return None
+            try:
+                return synthesize(text, self.api_key, self.voice)
+            except TTSError as e:
+                last = e
+                if i < attempts - 1:
+                    print(f"\n  ⚠️ TTS 失败，重试一次：{e}")
+                    time.sleep(0.6)
+        raise last or TTSError("合成失败")
 
 
 class ChatLoop:
@@ -153,6 +194,7 @@ class ChatLoop:
         self.llm = LLM(asr_key, model=llm_model, system=system_prompt)
         self.speaker = Speaker(asr_key, voice)
         self.thinking = False
+        self._loud_frames = 0
 
         self.loop = VoiceLoop(
             api_key=asr_key,
@@ -163,9 +205,35 @@ class ChatLoop:
             on_transcript=self._on_user_said,
         )
 
-        # 打断：每帧回调，检测用户开口
-        self._orig_render = self.loop._render_status
+        # 逐帧音量 → 打断判定
+        self.loop.on_voice_level = self._check_barge_in
+
+        # 界面
         self.loop._render_status = self._render
+
+    # ---------- 打断 ----------
+
+    def _check_barge_in(self, rms: float) -> None:
+        """播放期间检测到用户开口 → 立刻闭嘴。
+
+        每帧调用（10 帧/秒）。比等 ASR 快 1~2 秒。
+        """
+        if not self.bargein or not self.speaker.busy:
+            self._loud_frames = 0
+            return
+
+        # 起音阶段不判断（自身回传 + AEC 收敛期）
+        if (time.time() - self.speaker.started_at) * 1000 < BARGE_IN_GRACE_MS:
+            return
+
+        if rms > BARGE_IN_RMS:
+            self._loud_frames += 1
+            if self._loud_frames >= BARGE_IN_FRAMES:
+                print(f"\n  🤐 打断（音量 {rms:.3f}），停止播报\n")
+                self.speaker.stop()
+                self._loud_frames = 0
+        else:
+            self._loud_frames = 0
 
     # ---------- 主流程 ----------
 

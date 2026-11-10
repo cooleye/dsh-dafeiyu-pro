@@ -43,6 +43,9 @@ from dsh_agent import DshAgent  # noqa: E402
 from llm_qwen import LLM, LLMError  # noqa: E402
 from phase2_listen import VoiceLoop  # noqa: E402
 from phase3_chat import (  # noqa: E402
+    BARGE_IN_FRAMES,
+    BARGE_IN_GRACE_MS,
+    BARGE_IN_RMS,
     MAX_BUFFER_CHARS,
     MIN_SENTENCE_CHARS,
     SENTENCE_END,
@@ -57,6 +60,15 @@ from voice_config import load_keys  # noqa: E402
 STALL_1 = "好的，我看看"
 STALL_2 = "这个要花点时间，你先忙别的"
 STALL_DELAY = 8.0
+
+# ---------- 权限确认 ----------
+# DSH agent 默认跑在 workspace-write 沙箱里，写不了桌面。
+# 要写桌面得用 DSH_PERMISSION_MODE=danger-full-access —— 但这等于放开整台机器。
+# 所以：默认不放开，任务前问一句，只有明确说「允许」才升权。
+PERMISSION_ASK = "这个任务可能要写文件，允许我操作吗？说允许，或者说不"
+PERMISSION_OK_WORDS = ["允许", "可以", "好的", "行", "同意", "准了", "授权"]
+PERMISSION_NO_WORDS = ["不", "不行", "拒绝", "别", "不要", "算了"]
+PERMISSION_TIMEOUT = 12.0
 
 # 念之前把结果里的 Markdown 清掉
 MD_PATTERNS = [
@@ -110,6 +122,8 @@ class Assistant:
         use_agent: bool = True,
         stall_delay: float = STALL_DELAY,
         dialogue_timeout: float = 40.0,
+        ask_permission: bool = True,
+        allow_full_access: bool = False,
     ):
         self.llm = LLM(api_key, model=llm_model)
         self.tools = Tools(search_key)
@@ -122,6 +136,13 @@ class Assistant:
 
         self.thinking = False
         self.current_route: Route | None = None
+        self._loud_frames = 0
+
+        # 权限
+        self.ask_permission = ask_permission
+        self.allow_full_access = allow_full_access
+        self._pending_task: str | None = None
+        self._perm_deadline = 0.0
 
         self.loop = VoiceLoop(
             api_key=api_key,
@@ -131,7 +152,26 @@ class Assistant:
             dialogue_timeout=dialogue_timeout,
             on_transcript=self._on_user_said,
         )
+        self.loop.on_voice_level = self._check_barge_in
         self.loop._render_status = self._render
+
+    # ---------- 打断 ----------
+
+    def _check_barge_in(self, rms: float) -> None:
+        """播放期间一开口就闭嘴（不等 ASR）。"""
+        if not self.speaker.busy:
+            self._loud_frames = 0
+            return
+        if (time.time() - self.speaker.started_at) * 1000 < BARGE_IN_GRACE_MS:
+            return
+        if rms > BARGE_IN_RMS:
+            self._loud_frames += 1
+            if self._loud_frames >= BARGE_IN_FRAMES:
+                print(f"\n  🤐 打断（音量 {rms:.3f}），停止播报\n")
+                self.speaker.stop()
+                self._loud_frames = 0
+        else:
+            self._loud_frames = 0
 
     # ---------- 主流程 ----------
 
@@ -153,9 +193,13 @@ class Assistant:
             self.speaker.stop()
         self.speaker.reset()
 
+        # ① 正在等权限答复 → 这句话当回答处理，不派活
+        if self._pending_task is not None:
+            self._handle_permission_reply(text)
+            return
+
         if self.agent_busy:
-            print("  ⏳ 之前的任务还在跑，这句先记下")
-            # 简单策略：直接拒绝，避免并发
+            print("  ⏳ 之前的任务还在跑")
             self.speaker.say("我还在忙上一个任务，等一下再说")
             return
 
@@ -167,6 +211,50 @@ class Assistant:
             self._do_task(text, route)
         else:
             self._do_chat(text, route)
+
+    # ---------- 权限确认 ----------
+
+    def _handle_permission_reply(self, text: str) -> None:
+        """用户对「允许吗」的答复。"""
+        task = self._pending_task
+        self._pending_task = None
+        low = text.strip()
+
+        if any(w in low for w in PERMISSION_NO_WORDS) and not any(
+                w in low for w in PERMISSION_OK_WORDS):
+            print("  🚫 用户拒绝")
+            self.speaker.say("好，那我不动了")
+            return
+
+        if any(w in low for w in PERMISSION_OK_WORDS):
+            print("  ✅ 用户授权，以完整权限重跑")
+            self.speaker.say("好，那我动手了")
+            self._run_task(task or "", granted=True)
+            return
+
+        # 既不是同意也不是拒绝 → 当没听清，再问一次（但不再无限循环）
+        print(f"  ❓ 没听清授权答复：{low}")
+        self.speaker.say("我没听清，你说允许还是不允许")
+        self._pending_task = task
+        self._perm_deadline = time.time() + PERMISSION_TIMEOUT
+
+    def _needs_permission(self, task: str) -> bool:
+        """判断这个任务要不要升权。
+
+        命中「写文件到工作区外」的特征才问，否则用默认沙箱直接跑。
+        误判的代价：多问一句；漏判的代价：任务失败——所以宁可多问。
+        """
+        if self.allow_full_access or not self.ask_permission:
+            return False
+
+        write_hints = ["保存", "写到", "存到", "放到", "创建一个", "新建", "生成一个文件",
+                       "导出", "下载到", "改一下这个文件"]
+        outside_hints = ["桌面", "desktop", "文档", "下载", "图片", "D:", "C:",
+                         "我的电脑", "文件夹"]
+        has_write = any(w in task for w in write_hints)
+        has_outside = any(w in task.lower() if w.isascii() else w in task
+                          for w in outside_hints)
+        return has_write and has_outside
 
     # ---------- 路径 A/B：直连 LLM（可带工具） ----------
 
@@ -232,6 +320,25 @@ class Assistant:
     # ---------- 路径 C：DSH agent ----------
 
     def _do_task(self, text: str, route: Route) -> None:
+        # 需要写工作区外的文件 → 先问一句
+        if self._needs_permission(text):
+            print(f"  🔐 这个任务要写文件，先征得同意")
+            self.speaker.say(PERMISSION_ASK)
+            self._pending_task = text
+            self._perm_deadline = time.time() + PERMISSION_TIMEOUT
+            # 超时视为拒绝
+            def timeout_check():
+                time.sleep(PERMISSION_TIMEOUT + 0.5)
+                if self._pending_task == text:
+                    self._pending_task = None
+                    print("  ⏱ 权限确认超时，按拒绝处理")
+                    self.speaker.say("没等到你答复，那我先不动了")
+            threading.Thread(target=timeout_check, daemon=True).start()
+            return
+
+        self._run_task(text, granted=False)
+
+    def _run_task(self, text: str, granted: bool) -> None:
         self.agent_busy = True
         t0 = time.time()
 
@@ -239,7 +346,6 @@ class Assistant:
         print(f"  🔊 垫场1：「{STALL_1}」")
         self.speaker.say(STALL_1)
 
-        # 第二句垫场：过了 N 秒还没完成就补一句
         second_spoken = [False]
 
         def stall_timer():
@@ -267,8 +373,12 @@ class Assistant:
                 print(f"  错误：{output[:200]}")
                 self.speaker.say("呜……这个任务没做成")
 
-        print(f"  🚀 派给 DSH agent：{text[:40]}{'…' if len(text)>40 else ''}")
-        self.agent.run_async(text, on_done)
+        print(f"  🚀 派给 DSH agent"
+              f"{'（完整权限）' if granted else '（工作区沙箱）'}："
+              f"{text[:36]}{'…' if len(text)>36 else ''}")
+        self.agent.run_async(text, on_done, permission_mode=(
+            "danger-full-access" if granted else "workspace-write"
+        ))
 
     # ---------- 界面 ----------
 
@@ -300,6 +410,10 @@ def main() -> int:
                    help="第二句垫场的延迟秒数")
     p.add_argument("--timeout", type=float, default=40.0,
                    help="唤醒后无语音的退回时间")
+    p.add_argument("--trusted", action="store_true",
+                   help="信任模式：不问权限，任务一律给完整权限（谨慎）")
+    p.add_argument("--no-ask", action="store_true",
+                   help="不询问权限，任务一律用工作区沙箱（写桌面会失败）")
     args = p.parse_args()
 
     keys = load_keys()
@@ -321,6 +435,8 @@ def main() -> int:
         use_agent=not args.no_agent,
         stall_delay=args.stall,
         dialogue_timeout=args.timeout,
+        ask_permission=not args.no_ask,
+        allow_full_access=args.trusted,
     )
     app.run()
     return 0

@@ -28,8 +28,8 @@ from dataclasses import dataclass
 # 命中这些，基本可以确定是要「干活」而不是聊天。
 # 注意：不要用太泛的词（比如「写」单独出现，可能是「写得好」）。
 TASK_PATTERNS = [
-    # 产出类
-    r"写(一|个|下|篇|份)?\s*(文档|报告|方案|文章|脚本|程序|代码|函数|类|网页|页面)",
+    # 产出类（落到文件/代码才算活；纯创作留给 LLM 快速答）
+    r"写(一|个|下|篇|份|首|段)?\s*(文档|报告|方案|文章|脚本|程序|代码|函数|类|网页|页面)",
     r"(做|生成|创建|建)(一|个|下)?\s*(文档|报告|表格|图表|网页|脚本|程序|项目|目录|文件)",
     # 代码类
     r"(改|修改|重构|优化|调试|修复|实现|开发|部署)(一下|下)?\s*(这|那|代码|程序|项目|功能|bug|接口|函数)",
@@ -39,7 +39,10 @@ TASK_PATTERNS = [
     r"(帮我|给我).{0,12}(重构|改|优化|修复|部署|配置|安装|跑通)",
     # 资料类（要读+整理，不是一句话能答的）
     r"(查|搜|找|整理|总结)\s*(一下|下)?\s*(资料|文档|教程|用法|怎么用|如何实现)",
-    r"(做个|写个|整理一份)\s*(对比|调研|分析|报告|清单)",
+    r"(做个|做一个|写个|写一份|整理一份)\s*(对比|调研|分析|报告|清单|总结)",
+    # 落盘类：明确要求存文件，必然要动文件系统
+    r"(保存|存|写|放|导出).{0,8}(到|在).{0,6}(桌面|文件|硬盘|本地|磁盘|电脑)",
+    r"(保存|存|导出)到(电脑|本地|桌面)",
 ]
 
 # ---------- 数据类 ----------
@@ -65,6 +68,9 @@ CHAT_PATTERNS = [
     # 自我认知/身份类，一句话就能答，不需要工具
     r"(你是谁|你叫什么|你的名字|你是什么|介绍一下你自己|介绍下你自己)",
     r"^(你能做什么|你会什么|你有什么功能)",
+    # 让人闭嘴 / 结束对话
+    r"^(好了|行了|够了|停|安静|闭嘴|别说了|不用了|不要了)",
+    r"(闭嘴|别说了|别念了|安静|停下|不用说了)",
 ]
 
 
@@ -80,7 +86,28 @@ class Route:
 
 
 def _norm(text: str) -> str:
-    return text.strip()
+    """归一化：去掉语气词和标点。
+
+    为什么需要：ASR 的输出里塞满了「呃」「嗯」和句号，
+    比如「你帮我。呃，写一写一个」——
+    直接匹配「帮我写」会失败，归一化成「你帮我写一写一个」才匹配得上。
+    """
+    t = text.strip()
+    # 语气词 / 口头禅
+    for f in ("呃", "嗯", "啊", "哦", "额", "那个", "就", "这个"):
+        t = t.replace(f, "")
+    # 标点（保留英文字母数字）
+    t = re.sub(r"[\s，。！？、,.!?；;：:…~～\"'“”‘’（）()\[\]【】]", "", t)
+    return t
+
+
+def _match(patterns, text: str):
+    """在归一化文本上匹配，返回命中的片段。"""
+    for pat in patterns:
+        m = re.search(pat, text)
+        if m:
+            return m
+    return None
 
 
 def classify(text: str, force: str = "") -> Route:
@@ -88,36 +115,31 @@ def classify(text: str, force: str = "") -> Route:
 
     force: 空 / "chat" / "data" / "task"，强制指定
     """
-    text = _norm(text)
-    if not text:
+    raw = _norm(text)
+    if not raw:
         return Route("chat", "空输入", 0.0)
 
     if force in ("chat", "data", "task"):
         return Route(force, "手动指定", 1.0)
 
     # 1) 聊天优先排除
-    for pat in CHAT_PATTERNS:
-        m = re.search(pat, text, re.IGNORECASE)
-        if m:
-            # 但如果同时带强任务特征，还是判 task
-            for tpat in TASK_PATTERNS:
-                tm = re.search(tpat, text)
-                if tm:
-                    return Route("task", "聊天词+任务词，按任务处理",
-                                 0.75, tm.group(0))
-            return Route("chat", "命中聊天模式", 0.85, m.group(0))
+    m = _match(CHAT_PATTERNS, raw)
+    if m:
+        # 但如果同时带强任务特征，还是判 task
+        tm = _match(TASK_PATTERNS, raw)
+        if tm:
+            return Route("task", "聊天词+任务词，按任务处理", 0.75, tm.group(0))
+        return Route("chat", "命中聊天模式", 0.85, m.group(0))
 
     # 2) 强任务词
-    for pat in TASK_PATTERNS:
-        m = re.search(pat, text)
-        if m:
-            return Route("task", "命中任务模式", 0.85, m.group(0))
+    m = _match(TASK_PATTERNS, raw)
+    if m:
+        return Route("task", "命中任务模式", 0.85, m.group(0))
 
     # 3) 数据类
-    for pat in DATA_PATTERNS:
-        m = re.search(pat, text)
-        if m:
-            return Route("data", "命中数据模式", 0.8, m.group(0))
+    m = _match(DATA_PATTERNS, raw)
+    if m:
+        return Route("data", "命中数据模式", 0.8, m.group(0))
 
     # 4) 兜底：带工具聊天（它自己会决定要不要查）
     return Route("data", "兜底：带工具，让模型自己决定", 0.5)

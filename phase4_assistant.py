@@ -39,6 +39,7 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
+from audio_player import sapi_speak  # noqa: E402
 from dsh_agent import DshAgent  # noqa: E402
 from llm_qwen import LLM, LLMError  # noqa: E402
 from phase2_listen import VoiceLoop  # noqa: E402
@@ -78,6 +79,68 @@ STOP_TASK_WORDS = [
 ]
 # 进度推给气泡的最小间隔（秒），防刷屏
 PROGRESS_THROTTLE = 3.0
+
+# ---------- 退下（回到待命）----------
+# 说了就闭嘴、停止监听，直到下次叫「大肥鱼」才恢复。
+# 收录的都是口语里真会说的说法，含 ASR 常见错听（推下/退下吧）。
+FAREWELL_WORDS = [
+    "退下吧", "退下", "推下", "退吧", "下去吧", "走开吧", "你走吧", "走吧",
+    "退出吧", "退出", "你可以走了", "退了吧", "退一下",
+    "去休息吧", "休息吧", "睡吧", "歇着吧",
+    "没事了", "不聊了", "先这样", "拜拜", "再见", "拜拜了",
+    "关了吧", "关闭吧", "别听了",
+]
+FAREWELL_REPLY = "好，那我退下了"
+# 退下词后面最多再跟几个字（「退下吧」「那退下吧」可以，「退下这个词什么意思」不行）
+FAREWELL_EXTRA_CHARS = 4
+# 可以剥掉的客气/引导前缀
+FAREWELL_PREFIXES = ("请你", "麻烦你", "你", "那", "就", "先", "现在", "可以")
+FAREWELL_PARTICLES = "吧啊呀了呢哈哦嘛"
+
+
+def _norm_text(text: str) -> str:
+    """去掉标点和语气词，便于做指令匹配。"""
+    t = (text or "").strip()
+    for f in ("呃", "嗯", "啊", "哦", "额", "那个"):
+        t = t.replace(f, "")
+    return re.sub(r"[\s，。！？、,.!?；;：:…~～\"'“”‘’（）()]", "", t)
+
+
+def _strip_decoration(t: str) -> str:
+    """剥掉「你」「那」「吧」这类装饰。"""
+    changed = True
+    while changed:
+        changed = False
+        for p in FAREWELL_PREFIXES:
+            if t.startswith(p) and len(t) > len(p):
+                t = t[len(p):]
+                changed = True
+    while t and t[-1] in FAREWELL_PARTICLES:
+        t = t[:-1]
+    return t
+
+
+def is_farewell(text: str) -> bool:
+    """判断是不是「退下」类指令。
+
+    规则：**必须以退下词开头**，且后面最多再跟 4 个字。
+
+    为什么要加这条限制：
+      只做「包含匹配」的话，「退下这个词什么意思」也会被判成退下，
+      宠物就莫名其妙自己退下了。
+      「我不用了那个功能」同理 —— 那句里的「不用了」不是让它退下。
+    """
+    t = _norm_text(text)
+    if not t:
+        return False
+
+    for cand in (t, _strip_decoration(t)):
+        if not cand:
+            continue
+        for w in FAREWELL_WORDS:
+            if cand.startswith(w) and len(cand) <= len(w) + FAREWELL_EXTRA_CHARS:
+                return True
+    return False
 
 # 念之前把结果里的 Markdown 清掉
 MD_PATTERNS = [
@@ -151,6 +214,8 @@ class Assistant:
         self._loud_frames = 0
         self._last_state: str | None = None
         self._task_started = 0.0
+        # 是否处于唤醒态。退下后置 False，LLM/任务线程还在跑也不会再说话。
+        self.active = False
 
         # 权限
         self.ask_permission = ask_permission
@@ -203,6 +268,9 @@ class Assistant:
     # ---------- 收到一句话 ----------
 
     def _on_user_said(self, text: str) -> None:
+        # 能走到这儿说明处于唤醒态
+        self.active = True
+
         if self.speaker.speaking:
             self.ev.log("🤐 打断，停止播报")
             self.speaker.stop()
@@ -215,6 +283,12 @@ class Assistant:
             self._handle_permission_reply(text)
             return
 
+        # ② 退下：进入待命，不再接受指令，直到下次唤醒
+        #    放在任务判断之前 —— 就算正在干活，说「退下」也要能停
+        if is_farewell(text):
+            self._farewell()
+            return
+
         if self.agent_busy:
             # ⭐ 先看是不是要停止任务
             if any(w in text for w in STOP_TASK_WORDS):
@@ -223,13 +297,13 @@ class Assistant:
                     self.agent.cancel()
                 self.agent_busy = False
                 self.ev.task_cancel()
-                self.speaker.say("好，停了")
+                self._say("好，停了")
                 return
 
             # 不是停止 → 报一下跑了多久
             elapsed = int(time.time() - self._task_started)
             self.ev.log(f"⏳ 还在忙，已跑 {elapsed} 秒")
-            self.speaker.say(f"还在忙，已经跑了 {elapsed} 秒。说停止可以取消")
+            self._say(f"还在忙，已经跑了 {elapsed} 秒。说停止可以取消")
             return
 
         route = classify(text)
@@ -253,18 +327,18 @@ class Assistant:
         if any(w in low for w in PERMISSION_NO_WORDS) and not any(
                 w in low for w in PERMISSION_OK_WORDS):
             self.ev.log("🚫 用户拒绝")
-            self.speaker.say("好，那我不动了")
+            self._say("好，那我不动了")
             return
 
         if any(w in low for w in PERMISSION_OK_WORDS):
             self.ev.log("✅ 用户授权，以完整权限重跑")
-            self.speaker.say("好，那我动手了")
+            self._say("好，那我动手了")
             self._run_task(task or "", granted=True)
             return
 
         # 既不是同意也不是拒绝 → 当没听清，再问一次（但不再无限循环）
         self.ev.log(f"❓ 没听清授权答复：{low}")
-        self.speaker.say("我没听清，你说允许还是不允许")
+        self._say("我没听清，你说允许还是不允许")
         self._pending_task = task
         self._perm_deadline = time.time() + PERMISSION_TIMEOUT
 
@@ -286,6 +360,48 @@ class Assistant:
                           for w in outside_hints)
         return has_write and has_outside
 
+    # ---------- 退下 ----------
+
+    def _say(self, text: str) -> None:
+        """往播放队列塞一句话。
+
+        退下之后 self.active 为 False，就不再说话 ——
+        否则 LLM 线程晚几秒产出，会在「已退下」之后突然开口。
+        """
+        if self.active:
+            self.speaker.say(text)
+
+    def _farewell(self) -> None:
+        """退下：闭嘴、停任务、停止监听，回到待命。
+
+        为什么用本地 SAPI 而不是云端 TTS：
+          这时候可能要断网/关程序了，云端合成 1 秒起还可能失败。
+          「好，那我退下了」这种短句，本地念完就安静了最稳。
+        """
+        self.ev.log("👋 退下")
+
+        # 有声任务在跑就取消（都退下了，跑完也没人听）
+        if self.agent_busy and self.agent:
+            self.agent.cancel()
+            self.agent_busy = False
+
+        # 停掉正在念的内容，清空待念队列
+        self.speaker.stop()
+        self.speaker.reset()
+
+        # 之后不再往播放队列塞东西（LLM 线程可能还在产出）
+        self.active = False
+        self.thinking = False
+        self._pending_task = None
+
+        self.ev.state("idle")
+        self.ev.log(f"🔊 「{FAREWELL_REPLY}」")
+        sapi_speak(FAREWELL_REPLY)
+
+        # 回到待命：关 ASR、停 VAD、等下次唤醒
+        self.loop._leave_awake()
+        print("\n  💤 已退下，等下次唤醒\n")
+
     # ---------- 路径 A/B：直连 LLM（可带工具） ----------
 
     def _do_chat(self, text: str, route: Route) -> None:
@@ -301,7 +417,7 @@ class Assistant:
             def flush(sent: str):
                 s = sent.strip()
                 if len(s) >= MIN_SENTENCE_CHARS:
-                    self.speaker.say(s)
+                    self._say(s)
                     spoken.append(s)
 
             def on_delta(d):
@@ -338,10 +454,10 @@ class Assistant:
                                   sentences=len(spoken), tools=used,
                                   text=reply)
                 if not reply.strip():
-                    self.speaker.say("唔，我没想好说什么")
+                    self._say("唔，我没想好说什么")
             except LLMError as e:
                 self.ev.error(f"回复失败：{e}")
-                self.speaker.say("呜……我这边卡住了")
+                self._say("呜……我这边卡住了")
             finally:
                 self.thinking = False
 
@@ -353,7 +469,7 @@ class Assistant:
         # 需要写工作区外的文件 → 先问一句
         if self._needs_permission(text):
             self.ev.permission_ask()
-            self.speaker.say(PERMISSION_ASK)
+            self._say(PERMISSION_ASK)
             self._pending_task = text
             self._perm_deadline = time.time() + PERMISSION_TIMEOUT
             # 超时视为拒绝
@@ -362,7 +478,7 @@ class Assistant:
                 if self._pending_task == text:
                     self._pending_task = None
                     self.ev.log("⏱ 权限确认超时，按拒绝处理")
-                    self.speaker.say("没等到你答复，那我先不动了")
+                    self._say("没等到你答复，那我先不动了")
             threading.Thread(target=timeout_check, daemon=True).start()
             return
 
@@ -375,7 +491,7 @@ class Assistant:
 
         # 第一句垫场：本地秒回
         self.ev.log(f"🔊 垫场1：「{STALL_1}」")
-        self.speaker.say(STALL_1)
+        self._say(STALL_1)
 
         # 进度上报（节流，别刷屏）
         last_progress = [0.0]
@@ -404,7 +520,7 @@ class Assistant:
                 elapsed = time.time() - t0
                 if round_no == 1:
                     self.ev.log(f"🔊 垫场2：「{STALL_2}」")
-                    self.speaker.say(STALL_2)
+                    self._say(STALL_2)
                 else:
                     # 再往后一直念会很烦，只更气泡
                     self.ev.task_progress(f"{elapsed:.0f}s · 还在跑")
@@ -421,16 +537,16 @@ class Assistant:
                 if not say:
                     say = "做完了，但没给我内容"
                 self.ev.log(f"📄 要念的内容：{say[:120]}…")
-                self.speaker.say(say)
+                self._say(say)
             else:
                 self.ev.log(f"错误：{output[:200]}")
                 # 区分「被取消」和「失败」
                 if "取消" in output:
-                    self.speaker.say("好，停了")
+                    self._say("好，停了")
                 elif "超时" in output:
-                    self.speaker.say("这个任务太久没跑完，我放弃了")
+                    self._say("这个任务太久没跑完，我放弃了")
                 else:
-                    self.speaker.say("呜……这个任务没做成")
+                    self._say("呜……这个任务没做成")
 
         self.ev.task_start(text, granted)
         self.agent.run_async(text, on_done, permission_mode=(

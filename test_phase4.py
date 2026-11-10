@@ -90,9 +90,14 @@ class StubVoice:
     def __init__(self, *a, **kw):
         self.state = "awake"
         self.speaking = False
+        self.left = 0
 
     def _render_status(self, rms):
         pass
+
+    def _leave_awake(self):
+        self.left += 1
+        self.state = "idle"
 
     def run(self):
         pass
@@ -299,6 +304,90 @@ def t_progress_event() -> bool:
     return ok
 
 
+def t_farewell_detect() -> bool:
+    """退下指令的识别：该中的中，不该中的别中。"""
+    from phase4_assistant import is_farewell
+
+    should = ["你退下吧", "退下吧", "你退出吧", "退出", "没事了",
+              "先这样吧", "拜拜", "再见", "去休息吧", "你可以走了", "推下吧"]
+    should_not = ["我不用了那个功能", "你不用解释那么多，继续说",
+                  "退下这个词什么意思", "今天天气怎么样", "帮我写个脚本"]
+
+    bad = []
+    for s in should:
+        if not is_farewell(s):
+            bad.append(f"漏判:{s}")
+    for s in should_not:
+        if is_farewell(s):
+            bad.append(f"误判:{s}")
+
+    ok = not bad
+    print(f"\n[退下识别]  {'✅' if ok else '❌'}")
+    print(f"  应中 {len(should)} 条 / 不应中 {len(should_not)} 条")
+    if bad:
+        for b in bad:
+            print(f"    {b}")
+    return ok
+
+
+def t_farewell_flow() -> bool:
+    """说「退下吧」→ 回到待命、不再说话。"""
+    spoken = []
+    with patch("phase4_assistant.sapi_speak", lambda t: spoken.append(t)):
+        app = make_app()
+        app.active = True
+        app._on_user_said("退下吧")
+        left = app.loop.left
+        active = app.active
+        said = list(spoken)
+
+    ok = (left == 1 and active is False and any("退下" in s for s in said))
+    print(f"\n[退下流程]  {'✅' if ok else '❌'}")
+    print(f"  回待命次数={left}  active={active}  本地念={said}")
+    return ok
+
+
+def t_farewell_silences_late_reply() -> bool:
+    """退下之后，LLM 晚产出也不该再说话。"""
+    app = make_app()
+    app.active = True
+    app._say("先说话")           # 这会进队列
+    before = len(app.speaker.said)
+
+    with patch("phase4_assistant.sapi_speak", lambda t: None):
+        app._on_user_said("退下吧")
+
+    # 退下后 LLM 线程迟到的产出
+    app.thinking = True
+    app._say("迟到的回复")
+
+    after = len(app.speaker.said)
+    ok = after == before      # 迟到的那句不该进去
+    print(f"\n[退下后静音]  {'✅' if ok else '❌'}")
+    print(f"  退下前队列={before} 退下后={after}（应相等）")
+    return ok
+
+
+def t_farewell_cancels_task() -> bool:
+    """任务跑着时说退下 → 任务取消 + 回待命。"""
+    app = make_app(agent_delay=10)
+    app.active = True
+    app._on_user_said("帮我写一个 Python 脚本")
+    assert app.agent_busy
+
+    with patch("phase4_assistant.sapi_speak", lambda t: None):
+        app._on_user_said("退下吧")
+
+    ok = (app.agent.cancelled == 1
+          and app.agent_busy is False
+          and app.active is False
+          and app.loop.left == 1)
+    print(f"\n[退下时取消任务]  {'✅' if ok else '❌'}")
+    print(f"  cancel={app.agent.cancelled} busy={app.agent_busy} "
+          f"active={app.active} 待命={app.loop.left}")
+    return ok
+
+
 def t_no_permission_needed() -> bool:
     """普通任务（不写外部文件）→ 不该问，直接用沙箱跑。"""
     app = make_app()
@@ -418,6 +507,10 @@ def main() -> int:
         t_busy_reports_elapsed(),
         t_stop_variants(),
         t_progress_event(),
+        t_farewell_detect(),
+        t_farewell_flow(),
+        t_farewell_silences_late_reply(),
+        t_farewell_cancels_task(),
         t_no_permission_needed(),
         t_barge_in(),
         t_barge_in_grace(),

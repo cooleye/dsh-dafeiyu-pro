@@ -80,10 +80,27 @@ PERMISSION_FALLBACK = "没听到答复，我先在沙箱里做，文件会存在
 # 没有 AEC，扬声器漏进麦克风的回声实测比用户正常说话还响
 # （回声 0.06~0.19 vs 说话 0.026~0.058），所以不能靠阈值区分。
 # 改看「麦克风音量跟不跟播放音量走」：回声跟，真人说话不跟。
-BARGE_IN_CORR_WINDOW = 1.0      # 取最近多少秒的两条曲线做相关
-BARGE_IN_ECHO_LAG = 0.08        # 声音从扬声器到麦克风的延迟估计
-BARGE_IN_ECHO_CORR = 0.5        # 相关系数高于此判为回声
+BARGE_IN_CORR_WINDOW = 1.2      # 取最近多少秒的两条曲线做相关
+BARGE_IN_ECHO_MAX_LAG = 0.50    # 滞后搜索上限（声卡缓冲 + 系统混音）
+BARGE_IN_LAG_STEP = 0.05        # 滞后搜索步长
+BARGE_IN_MATCH_TOL = 0.08       # 找最近样本时允许的时间偏差
+BARGE_IN_ECHO_CORR = 0.55       # 相关系数高于此判为回声
 BARGE_IN_PLAY_MIN = 0.01        # 播放音量低于此，谈不上回声
+
+
+def _pearson(xs: list[float], ys: list[float]) -> float | None:
+    """皮尔逊相关系数；任一侧没有波动时返回 None。"""
+    n = len(xs)
+    if n < 3:
+        return None
+    mx = sum(xs) / n
+    my = sum(ys) / n
+    vx = sum((x - mx) ** 2 for x in xs)
+    vy = sum((y - my) ** 2 for y in ys)
+    if vx <= 1e-12 or vy <= 1e-12:
+        return None
+    cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+    return cov / ((vx ** 0.5) * (vy ** 0.5))
 
 # ---------- 停止任务 ----------
 STOP_TASK_WORDS = [
@@ -290,23 +307,27 @@ class Assistant:
         if play_level < BARGE_IN_PLAY_MIN:
             # 播放本身很轻，麦克风却这么响 → 确实是用户在说
             is_echo = False
-            corr = None
+            corr_info = None
         else:
-            corr = self._echo_correlation(now)
+            corr_info = self._echo_correlation(now)
             # 样本不够时算不出相关 —— 播放正响着，宁可当成回声，
             # 因为误判的代价是「机器把自己打断」，比漏判难看得多。
-            is_echo = corr is None or corr > BARGE_IN_ECHO_CORR
+            is_echo = corr_info is None or corr_info[0] > BARGE_IN_ECHO_CORR
 
         if is_echo:
             self._loud_frames = 0
             if rms > 0.05:
-                c = "?" if corr is None else f"{corr:.2f}"
-                self.ev.log(f"🔇 回声（相关 {c}，播放 {play_level:.3f}），不打断")
+                if corr_info is None:
+                    self.ev.log(f"🔇 回声？（样本不足，播放 {play_level:.3f}），不打断")
+                else:
+                    self.ev.log(f"🔇 回声（相关 {corr_info[0]:.2f}@滞后 {corr_info[1]:.2f}s，"
+                                f"播放 {play_level:.3f}），不打断")
             return
 
         self._loud_frames += 1
         if self._loud_frames >= BARGE_IN_FRAMES:
-            print(f"\n  🤐 打断（音量 {rms:.3f}，播放 {play_level:.3f}），停止播报\n")
+            info = "?" if corr_info is None else f"{corr_info[0]:.2f}@{corr_info[1]:.2f}s"
+            print(f"\n  🤐 打断（音量 {rms:.3f}，播放 {play_level:.3f}，相关 {info}），停止播报\n")
             self.speaker.stop()
             self._loud_frames = 0
 
@@ -315,35 +336,45 @@ class Assistant:
         series = self.speaker.player.level_series(now - BARGE_IN_CORR_WINDOW)
         return max((r for _, r in series), default=0.0)
 
-    def _echo_correlation(self, now: float) -> float | None:
-        """麦克风音量 vs 播放音量 的相关系数。
+    def _echo_correlation(self, now: float) -> tuple[float, float] | None:
+        """麦克风音量 vs 播放音量 的相关系数，返回 (相关系数, 最佳滞后)。
 
         返回 None 表示样本不够，调用方按「当成回声」处理。
+
+        ⚠️ 滞后必须**搜出来**，不能写死。
+        声音从我们写入声卡到被麦克风录回来，中间隔着声卡缓冲和系统混音，
+        实测在 0~0.5 秒之间飘，写死一个值会让相关性时高时低，
+        表现就是「有时判对、有时还是自己打断自己」。
         """
-        window = BARGE_IN_CORR_WINDOW
-        since = now - window
-
+        since = now - BARGE_IN_CORR_WINDOW
         mic = [(t, r) for t, r in list(self._mic_levels) if t >= since]
-        play = self.speaker.player.level_series(since - BARGE_IN_ECHO_LAG)
-        if len(mic) < 4 or len(play) < 4:
+        # 多取一段播放历史，给滞后搜索留空间
+        play = self.speaker.player.level_series(since - BARGE_IN_ECHO_MAX_LAG)
+        if len(mic) < 5 or len(play) < 5:
             return None
 
-        # 把播放曲线对齐到麦克风的采样时刻（各取最近的一个）
-        xs: list[float] = []
-        ys: list[float] = []
-        for t, r in mic:
-            nearest = min(play, key=lambda p: abs(p[0] - (t - BARGE_IN_ECHO_LAG)))
-            xs.append(nearest[1])
-            ys.append(r)
+        best: tuple[float, float] | None = None
+        lag = 0.0
+        while lag <= BARGE_IN_ECHO_MAX_LAG + 1e-9:
+            xs: list[float] = []
+            ys: list[float] = []
+            for t, r in mic:
+                target = t - lag
+                nearest = min(play, key=lambda p: abs(p[0] - target))
+                if abs(nearest[0] - target) > BARGE_IN_MATCH_TOL:
+                    continue
+                xs.append(nearest[1])
+                ys.append(r)
+            lag += BARGE_IN_LAG_STEP
+            if len(xs) < 5:
+                continue
+            corr = _pearson(xs, ys)
+            if corr is None:
+                continue
+            if best is None or corr > best[0]:
+                best = (corr, lag)
 
-        mx = sum(xs) / len(xs)
-        my = sum(ys) / len(ys)
-        vx = sum((x - mx) ** 2 for x in xs)
-        vy = sum((y - my) ** 2 for y in ys)
-        if vx <= 1e-12 or vy <= 1e-12:
-            return None
-        cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-        return cov / ((vx ** 0.5) * (vy ** 0.5))
+        return best
 
     # ---------- 主流程 ----------
 

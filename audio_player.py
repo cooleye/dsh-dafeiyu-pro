@@ -35,6 +35,27 @@ OUTPUT_DEVICE_FILE = Path(
     or str(Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "dsh-dafeiyu" / "output-device.txt")
 )
 
+# 音量：
+#   · TARGET_PEAK —— 每次播放前把波形峰值归一到这个值（TTS 原始峰值只有 0.36，
+#     不归一的话天生就小声，实测用户反馈「听不大声音」）
+#   · MAX_GAIN    —— 最多放大多少倍，防止把噪声底也一起放大
+#   · volume.txt  —— 用户再叠一个倍率，改完重启语音服务生效
+TARGET_PEAK = 0.95
+MAX_GAIN = 3.5
+VOLUME_FILE = Path(
+    os.environ.get("DSH_DAFEIYU_VOLUME_FILE")
+    or str(Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "dsh-dafeiyu" / "volume.txt")
+)
+
+
+def read_volume_setting() -> float:
+    """读用户音量倍率（默认 1.0）。"""
+    try:
+        text = VOLUME_FILE.read_text(encoding="utf-8-sig").strip()
+        return max(0.1, min(5.0, float(text)))
+    except (OSError, ValueError):
+        return 1.0
+
 
 def read_output_device_setting() -> str:
     try:
@@ -132,6 +153,18 @@ class Player:
             return sd.OutputStream(samplerate=sample_rate, channels=1,
                                    dtype="float32", device=None, blocksize=block)
 
+    @staticmethod
+    def _normalise(samples: np.ndarray) -> np.ndarray:
+        """把峰值拉到 TARGET_PEAK，再乘用户音量倍率。"""
+        peak = float(np.max(np.abs(samples))) if len(samples) else 0.0
+        gain = 1.0
+        if peak > 0.02:
+            gain = min(MAX_GAIN, TARGET_PEAK / peak)
+        gain *= read_volume_setting()
+        if abs(gain - 1.0) < 1e-3:
+            return samples
+        return np.clip(samples * gain, -1.0, 1.0)
+
     def stop(self) -> None:
         """请求停止当前播放。立即返回，实际停止在下一个音频块。"""
         self._stop_event.set()
@@ -140,6 +173,9 @@ class Player:
         """播放 float32 [-1,1] 的 PCM。
 
         返回 True = 正常播完，False = 被打断。
+
+        播放前会把峰值归一：TTS 出来的波形峰值只有 0.3 左右，
+        不归一就是「在响但听不大」。归一之后再叠用户音量倍率。
         """
         if da := samples.dtype:
             if da != np.float32:
@@ -147,6 +183,8 @@ class Player:
 
         if samples.ndim > 1:
             samples = samples.flatten()
+
+        samples = self._normalise(samples)
 
         self._stop_event.clear()
 

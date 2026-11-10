@@ -19,6 +19,8 @@
   tool             调用了工具
   task_start       派给 agent 的任务
   task_done        任务结束
+  task_progress    任务进度（气泡显示，不念）
+  task_cancel      任务被取消
   permission_ask   请求权限
   error            出错
   log              普通日志（终端才显示）
@@ -42,6 +44,8 @@ class BaseEvents:
     def tool(self, name: str, args) -> None: ...
     def task_start(self, task: str, granted: bool) -> None: ...
     def task_done(self, ok: bool, text: str) -> None: ...
+    def task_progress(self, text: str) -> None: ...
+    def task_cancel(self) -> None: ...
     def permission_ask(self) -> None: ...
     def error(self, message: str) -> None: ...
     def log(self, message: str) -> None: ...
@@ -94,6 +98,12 @@ class ConsoleEvents(BaseEvents):
 
     def task_done(self, ok: bool, text: str) -> None:
         self._p(f"  {'✅' if ok else '❌'} 任务{'完成' if ok else '失败'}")
+
+    def task_progress(self, text: str) -> None:
+        self._p(f"  ⏳ {text}")
+
+    def task_cancel(self) -> None:
+        self._p("  🛑 任务已取消")
 
     def permission_ask(self) -> None:
         self._p("  🔐 这个任务要写文件，先征得同意")
@@ -151,6 +161,12 @@ class JsonlEvents(BaseEvents):
 
     def task_done(self, ok: bool, text: str) -> None:
         self._emit("task_done", ok=ok, text=text[:800])
+
+    def task_progress(self, text: str) -> None:
+        self._emit("task_progress", text=str(text)[:200])
+
+    def task_cancel(self) -> None:
+        self._emit("task_cancel")
 
     def permission_ask(self) -> None:
         self._emit("permission_ask")

@@ -71,6 +71,14 @@ PERMISSION_OK_WORDS = ["允许", "可以", "好的", "行", "同意", "准了", 
 PERMISSION_NO_WORDS = ["不", "不行", "拒绝", "别", "不要", "算了"]
 PERMISSION_TIMEOUT = 12.0
 
+# ---------- 停止任务 ----------
+STOP_TASK_WORDS = [
+    "停止任务", "停掉任务", "取消任务", "别干了", "不要做了", "停下来",
+    "停止", "停下", "取消", "别做了", "算了别做", "不做了", "终止",
+]
+# 进度推给气泡的最小间隔（秒），防刷屏
+PROGRESS_THROTTLE = 3.0
+
 # 念之前把结果里的 Markdown 清掉
 MD_PATTERNS = [
     (re.compile(r"```[\s\S]*?```"), ""),          # 代码块
@@ -141,6 +149,7 @@ class Assistant:
         self.current_route: Route | None = None
         self._loud_frames = 0
         self._last_state: str | None = None
+        self._task_started = 0.0
 
         # 权限
         self.ask_permission = ask_permission
@@ -205,8 +214,20 @@ class Assistant:
             return
 
         if self.agent_busy:
-            self.ev.log("⏳ 之前的任务还在跑")
-            self.speaker.say("我还在忙上一个任务，等一下再说")
+            # ⭐ 先看是不是要停止任务
+            if any(w in text for w in STOP_TASK_WORDS):
+                self.ev.log("🛑 停止任务")
+                if self.agent:
+                    self.agent.cancel()
+                self.agent_busy = False
+                self.ev.task_cancel()
+                self.speaker.say("好，停了")
+                return
+
+            # 不是停止 → 报一下跑了多久
+            elapsed = int(time.time() - self._task_started)
+            self.ev.log(f"⏳ 还在忙，已跑 {elapsed} 秒")
+            self.speaker.say(f"还在忙，已经跑了 {elapsed} 秒。说停止可以取消")
             return
 
         route = classify(text)
@@ -348,21 +369,45 @@ class Assistant:
     def _run_task(self, text: str, granted: bool) -> None:
         self.agent_busy = True
         t0 = time.time()
+        self._task_started = t0
 
         # 第一句垫场：本地秒回
         self.ev.log(f"🔊 垫场1：「{STALL_1}」")
         self.speaker.say(STALL_1)
 
-        second_spoken = [False]
+        # 进度上报（节流，别刷屏）
+        last_progress = [0.0]
 
-        def stall_timer():
-            time.sleep(self.stall_delay)
-            if self.agent_busy and not second_spoken[0]:
-                second_spoken[0] = True
-                self.ev.log(f"🔊 垫场2：「{STALL_2}」")
-                self.speaker.say(STALL_2)
+        def on_progress(msg: str) -> None:
+            if not self.agent_busy:
+                return
+            now = time.time()
+            if now - last_progress[0] < PROGRESS_THROTTLE:
+                return
+            last_progress[0] = now
+            elapsed = now - t0
+            self.ev.task_progress(f"{elapsed:.0f}s · {msg}")
 
-        threading.Thread(target=stall_timer, daemon=True).start()
+        if self.agent:
+            self.agent.on_progress = on_progress
+
+        # 垫场循环：第一次补一句「花点时间」，之后只更气泡不说话
+        def stall_loop():
+            round_no = 0
+            while self.agent_busy:
+                time.sleep(self.stall_delay)
+                if not self.agent_busy:
+                    break
+                round_no += 1
+                elapsed = time.time() - t0
+                if round_no == 1:
+                    self.ev.log(f"🔊 垫场2：「{STALL_2}」")
+                    self.speaker.say(STALL_2)
+                else:
+                    # 再往后一直念会很烦，只更气泡
+                    self.ev.task_progress(f"{elapsed:.0f}s · 还在跑")
+
+        threading.Thread(target=stall_loop, daemon=True).start()
 
         def on_done(ok: bool, output: str):
             elapsed = time.time() - t0
@@ -377,7 +422,13 @@ class Assistant:
                 self.speaker.say(say)
             else:
                 self.ev.log(f"错误：{output[:200]}")
-                self.speaker.say("呜……这个任务没做成")
+                # 区分「被取消」和「失败」
+                if "取消" in output:
+                    self.speaker.say("好，停了")
+                elif "超时" in output:
+                    self.speaker.say("这个任务太久没跑完，我放弃了")
+                else:
+                    self.speaker.say("呜……这个任务没做成")
 
         self.ev.task_start(text, granted)
         self.agent.run_async(text, on_done, permission_mode=(

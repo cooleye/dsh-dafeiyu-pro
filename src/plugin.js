@@ -577,6 +577,12 @@ function mountCompanion(ctx, config = {}, eventCtx = ctx, logger) {
         case 'permission_ask':
           pushVoiceText('需要授权', '要写文件，等你答复')
           break
+        case 'task_progress':
+          pushVoiceText('干活中', msg.text)
+          break
+        case 'task_cancel':
+          pushVoiceText('已取消', '任务已停止')
+          break
         case 'tool':
           logger.info?.(`[voice] 调用工具 ${msg.name}`)
           break

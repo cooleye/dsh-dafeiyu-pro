@@ -68,6 +68,8 @@ class FakeAgent:
         self.modes: list[str] = []
         self.delay = 0.05
         self.result = ("ok", "任务结果：这是干完活的产出。")
+        self.on_progress = lambda msg: None
+        self.cancelled = 0
 
     def run_async(self, task, on_done, permission_mode="workspace-write"):
         self.calls.append(task)
@@ -81,7 +83,7 @@ class FakeAgent:
         threading.Thread(target=w, daemon=True).start()
 
     def cancel(self):
-        pass
+        self.cancelled += 1
 
 
 class StubVoice:
@@ -218,6 +220,85 @@ def t_permission_deny() -> bool:
     return ok
 
 
+def t_stop_task() -> bool:
+    """任务跑着的时候说「停止任务」→ 调 cancel，并复位 agent_busy。"""
+    app = make_app(agent_delay=10)   # 让它一直「跑着」
+    app._on_user_said("帮我写一个 Python 脚本")
+    assert app.agent_busy, "任务应处于运行状态"
+
+    app._on_user_said("停止任务")
+
+    ok = (app.agent.cancelled == 1
+          and app.agent_busy is False
+          and any("停" in s for s in app.speaker.said))
+    print(f"\n[停止任务]  {'✅' if ok else '❌'}")
+    print(f"  cancel 次数={app.agent.cancelled} agent_busy={app.agent_busy}")
+    print(f"  说了：{app.speaker.said}")
+    return ok
+
+
+def t_busy_reports_elapsed() -> bool:
+    """任务跑着时问进度 → 应该告诉你跑了多久，不是干巴巴一句「等着」。"""
+    app = make_app(agent_delay=10)
+    app._on_user_said("帮我写一个 Python 脚本")
+    app._task_started = time.time() - 12   # 假装已经跑了 12 秒
+
+    app._on_user_said("进度怎么样了")
+
+    said = app.speaker.said[-1] if app.speaker.said else ""
+    ok = "秒" in said and "停止" in said
+    print(f"\n[进度查询]  {'✅' if ok else '❌'}")
+    print(f"  说了：{said!r}")
+    return ok
+
+
+def t_stop_variants() -> bool:
+    """各种说法都能停。"""
+    words = ["停止任务", "取消", "别干了", "停下", "算了别做了"]
+    ok = True
+    for w in words:
+        app = make_app(agent_delay=10)
+        app._on_user_said("帮我写一个 Python 脚本")
+        app._on_user_said(w)
+        hit = app.agent.cancelled == 1
+        if not hit:
+            print(f"  ❌ 「{w}」没触发停止")
+            ok = False
+    print(f"\n[停止措辞]  {'✅' if ok else '❌'}  （{len(words)} 种说法）")
+    return ok
+
+
+def t_progress_event() -> bool:
+    """进度事件应该传到 events 层。"""
+    received = []
+
+    class Collect:
+        def __getattr__(self, name):
+            def fn(*a, **kw):
+                received.append((name, a))
+            return fn
+
+    from phase4_assistant import Assistant
+
+    with patch("phase4_assistant.VoiceLoop", lambda *a, **kw: StubVoice()), \
+         patch("phase4_assistant.Speaker", FakeSpeaker), \
+         patch("phase4_assistant.LLM", FakeLLM), \
+         patch("phase4_assistant.Tools", lambda *a, **kw: None), \
+         patch("phase4_assistant.DshAgent", lambda *a, **kw: FakeAgent()):
+        app = Assistant(api_key="fake", deepseek_key="", events=Collect())
+
+    app.agent.delay = 10
+    app._on_user_said("帮我写一个 Python 脚本")
+    app.agent.on_progress("调用工具：write")
+    app.agent.on_progress("写文件：test.md")
+
+    kinds = [k for k, _ in received]
+    # 第二条会被节流，能收到第一条就说明链路通了
+    ok = "task_progress" in kinds
+    print(f"\n[进度事件]  {'✅' if ok else '❌'}  收到 {kinds}")
+    return ok
+
+
 def t_no_permission_needed() -> bool:
     """普通任务（不写外部文件）→ 不该问，直接用沙箱跑。"""
     app = make_app()
@@ -333,6 +414,10 @@ def main() -> int:
         t_no_agent(),
         t_permission_grant(),
         t_permission_deny(),
+        t_stop_task(),
+        t_busy_reports_elapsed(),
+        t_stop_variants(),
+        t_progress_event(),
         t_no_permission_needed(),
         t_barge_in(),
         t_barge_in_grace(),

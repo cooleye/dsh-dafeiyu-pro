@@ -129,6 +129,17 @@ class Speaker:
     def reset(self) -> None:
         self.stop_flag.clear()
 
+    def set_voice(self, voice: str) -> None:
+        """换音色（立即生效，从下一句开始）。
+
+        只改 speaker 自己的字段，不动正在念的那句 ——
+        半句换声音会很怪。
+        """
+        v = (voice or "").strip()
+        if v and v != self.voice:
+            print(f"  🎨 音色切换：{self.voice} → {v}")
+            self.voice = v
+
     @property
     def speaking(self) -> bool:
         return self.busy or not self.q.empty()

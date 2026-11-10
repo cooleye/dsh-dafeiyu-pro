@@ -137,11 +137,72 @@ python phase4_assistant.py --audio-mode exclusive
 
 ### 自动回退
 
-选定的后端打不开时，会自动换下一个（WASAPI → DirectSound → MME → WDM-KS）。
+选定的后端打不开时，会自动换下一个（顺序见上方优先级表），
+整轮失败还会等 1.5 秒重试一次（设备刚被释放时会有延迟）。
 
 > ⚠️ 别用「预试开」来判断设备可用性 —— 实测反复开关设备会把
 > 音频子系统搞挂，连本来能用的 WDM-KS 都变成 `Invalid device`。
 > 正确做法是：按优先级挑一个，真开流失败了再换。
+
+---
+
+## 换音色
+
+### 能换哪些
+
+`qwen3-tts-flash` 实测可用 13 个音色：
+
+| 音色 | 风格 | 说明 |
+|---|---|---|
+| **Cherry** | 甜美女声 | **默认**，偏软萌 |
+| Serena | 温柔女声 | 柔和，适合深夜 |
+| Chelsie | 活泼女声 | 跳脱一点 |
+| Jada | 成熟女声 | 偏御姐 |
+| Sunny | 明亮女声 | 元气 |
+| Katerina | 御姐女声 | 低沉有气场 |
+| Ethan | 阳光男声 | 少年感 |
+| Dylan | 少年男声 | 年轻 |
+| Peter | 沉稳男声 | 可靠 |
+| Aiden | 磁性男声 | 低沉 |
+| Ryan | 播报男声 | 像新闻主播 |
+| Elias | 低音男声 | 很沉 |
+| Nofish | 特色音色 | 有点怪，试听一下 |
+
+### 怎么换（两个办法）
+
+**办法一：设置页下拉框（推荐）**
+
+```
+设置 → 插件 → dsh-dafeiyu-pro → TTS 音色  ▾
+```
+
+选完**下一句就生效，不用重启**。
+
+**办法二：命令行热改**
+
+```powershell
+$u = 'http://127.0.0.1:1752/plugins/dsh-dafeiyu/config'
+Invoke-WebRequest -Uri $u -Method Patch -UseBasicParsing `
+  -Body (@{voiceTts='Serena'} | ConvertTo-Json) -ContentType 'application/json'
+```
+
+### 先试听再选
+
+```powershell
+cd D:\project\dsh-dafeiyu-pro
+$env:PYTHONIOENCODING='utf-8'
+
+python preview_voices.py                 # 全部念一遍（约 30 秒）
+python preview_voices.py --voice Serena  # 只听一个
+python preview_voices.py --save          # 存成 wav 不播放
+```
+
+### 为什么能热改
+
+音色只是 `Speaker` 上的一个字段，换掉之后**下一句合成**就用新的。
+不动正在念的那句（半句换声音会很怪）。
+
+其它配置（音频设备、对话模型、agent 开关）还是要重启语音服务才生效。
 
 ---
 

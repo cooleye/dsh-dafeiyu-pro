@@ -371,6 +371,12 @@ class Assistant:
         if self.active:
             self.speaker.say(text)
 
+    def set_voice(self, voice: str) -> None:
+        """换 TTS 音色（立即生效，不用重启）。"""
+        if voice:
+            self.speaker.set_voice(voice)
+            self.ev.log(f"🎨 音色已切换为 {voice}")
+
     def _farewell(self) -> None:
         """退下：闭嘴、停任务、停止监听，回到待命。
 

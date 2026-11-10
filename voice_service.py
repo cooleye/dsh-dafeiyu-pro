@@ -148,9 +148,23 @@ class VoiceService:
         self.ev.log("已停止")
 
     def update_config(self, patch: dict) -> None:
-        self.config.update(patch or {})
-        # 只做了「重启生效」的简化处理：语音循环不容易热改
-        self.ev.log(f"配置已更新，重启生效：{list((patch or {}).keys())}")
+        patch = patch or {}
+        self.config.update(patch)
+
+        applied: list[str] = []
+
+        # 音色可以热改：Speaker 只换一个字段，下一句就生效
+        if "voice" in patch and self.assistant is not None:
+            try:
+                self.assistant.set_voice(patch["voice"])
+                applied.append("voice")
+            except Exception as e:
+                self.ev.error(f"换音色失败：{e}")
+
+        # 其它项（设备、模型等）要重建 Assistant
+        rest = [k for k in patch if k not in applied]
+        if rest:
+            self.ev.log(f"这些要重启才生效：{rest}")
 
     def note_ds_busy(self, busy: bool) -> None:
         """DSH 正在干活时，语音别插嘴（避免两边同时说话）。"""

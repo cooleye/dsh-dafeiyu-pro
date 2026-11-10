@@ -95,8 +95,16 @@ class VoiceLoop:
         self.awake_until = 0.0
         self.transcripts: list[str] = []
 
-        # ASR（每句一个新会话）
+        # ASR（每段语音一个独立会话）
         self.asr: AliyunASR | None = None
+
+        # 等 ASR 建连期间缓存的音频（重采样后的 16k PCM bytes）
+        # 不缓存的话，每段开始的头几百毫秒会丢字
+        self.pending_pcm: list[bytes] = []
+
+        # 会话代数：每开一段 +1。建连是异步的，完成时如果代数变了，
+        # 说明这段已经翻篇了，新连接直接丢掉，避免连接泄漏。
+        self.asr_gen = 0
 
         # 录音缓冲
         self.seg_buf: list[np.ndarray] = []
@@ -172,13 +180,14 @@ class VoiceLoop:
         self.seg_buf = []
         self.speaking = False
         self.silence_ms = 0.0
+        self.asr = None
+        self.pending_pcm = []
+        self.asr_gen += 1
 
         print(f"\n\n  🎯 唤醒：{keyword}")
         print(f"  🔊 「{self.wake_reply}」")
         sapi_speak(self.wake_reply)
         print("  👂 在听...\n")
-
-        self._start_asr()
 
     # ---------- 对话态：VAD 断句 + ASR ----------
 
@@ -196,6 +205,8 @@ class VoiceLoop:
                 self.speaking = True
                 self.seg_start = now
                 self.seg_buf = []
+                # ⭐ 惰性建会话：真正开口时才连云端，待命时不占连接
+                self._start_asr_async()
             self.silence_ms = 0.0
         elif self.speaking:
             # 迟滞：说话中用更低的阈值判断是否还在说
@@ -209,12 +220,17 @@ class VoiceLoop:
             self.awake_until = now + self.dialogue_timeout
 
             # ⭐ 边说边送 ASR —— 这样 partial 字幕能实时出来
-            if self.asr is not None:
-                pcm = (np.clip(frame, -1, 1) * 32767).astype(np.int16).tobytes()
+            pcm = (np.clip(frame, -1, 1) * 32767).astype(np.int16).tobytes()
+            asr_now = self.asr
+            if asr_now is not None:
                 try:
-                    self.asr.feed(pcm)
+                    asr_now.feed(pcm)
                 except Exception:
-                    pass  # 送失败不影响录音，断句时会处理
+                    # 会话刚被关掉（上一段收尾中）→ 存起来，等新会话补发
+                    self.pending_pcm.append(pcm)
+            else:
+                # 还在建连 → 先缓存
+                self.pending_pcm.append(pcm)
 
             seg_ms = len(self.seg_buf) * 100
 
@@ -233,20 +249,39 @@ class VoiceLoop:
         self.seg_buf = []
 
         if seg_ms < MIN_SPEECH_MS:
-            # 太短，丢掉这段（但 ASR 会话里已经有音频了，得重置）
-            if self.asr is not None:
-                try:
-                    self.asr.close()
-                except Exception:
-                    pass
-                self._start_asr()
+            # 太短（咳嗽、碰麦）→ 丢掉这段
+            asr_stale = self.asr
+            self.asr = None
+            self.asr_gen += 1
+            self.pending_pcm = []
+            if asr_stale is not None:
+                threading.Thread(target=asr_stale.close, daemon=True).start()
             return
 
-        # ⚠️ 先把当前 ASR 引用抓下来，再交给线程。
-        #    否则线程里读 self.asr 时，可能已经被下一次断句换成新的了
-        #    （desk-ai 踩过的坑：旧会话退出把新会话清掉，导致后续彻底不识别）。
+        # ⚠️ 立刻脱钩！这样后续音频不会再喂进这个即将关闭的会话。
+        #    之前没脱钩的后果：新一段音频进了已关闭的会话，
+        #    下次断句时 finish() 报「还没 start()」。
         asr_ref = self.asr
+        self.asr = None
+        my_gen = self.asr_gen
+        pending = self.pending_pcm
+        self.pending_pcm = []
+
+        # ⭐ 建连可能还在路上（慢网络），给一小段等待时间，
+        #    否则「唤醒后的第一段话」会被直接丢掉。
+        if asr_ref is None and pending:
+            deadline = time.time() + 2.0
+            while time.time() < deadline:
+                if self.asr is not None and self.asr_gen == my_gen:
+                    asr_ref = self.asr
+                    self.asr = None
+                    break
+                if self.asr_gen != my_gen:
+                    break          # 已经被新的一段接管了
+                time.sleep(0.02)
+
         if asr_ref is None:
+            print("\n  ⚠️ ASR 还没就绪，这段跳过\n")
             return
 
         print(f"\n  📤 断句（{seg_ms}ms），等识别结果 ...")
@@ -262,34 +297,59 @@ class VoiceLoop:
                     print("\n  （没识别出内容）\n")
             except Exception as e:
                 print(f"\n  ❌ 识别失败：{e}\n")
-            finally:
-                self._start_asr()
 
         # 后台跑，别阻塞录音
         threading.Thread(target=worker, daemon=True).start()
 
-    def _start_asr(self) -> None:
-        try:
-            self.asr = AliyunASR(
-                self.api_key,
-                on_partial=lambda t: print(f"\r  ⏳ {t:<50}", end="", flush=True),
-                on_final=lambda t: None,
-            )
-            self.asr.start()
-        except Exception as e:
-            print(f"\n  ❌ ASR 启动失败：{e}\n")
-            self.asr = None
+    def _start_asr_async(self) -> None:
+        """后台建 ASR 会话，建好把缓存的音频补发进去。"""
+        self.asr_gen += 1
+        gen = self.asr_gen
+
+        def run():
+            try:
+                asr = AliyunASR(
+                    self.api_key,
+                    on_partial=lambda t: print(f"\r  ⏳ {t:<50}", end="", flush=True),
+                    on_final=lambda t: None,
+                )
+                asr.start()
+            except Exception as e:
+                print(f"\n  ❌ ASR 启动失败：{e}\n")
+                if gen == self.asr_gen:
+                    self.pending_pcm = []
+                return
+
+            # 建连期间这段已经翻篇 / 已退出对话态 → 丢掉这条连接
+            if gen != self.asr_gen or self.state != "awake":
+                asr.close()
+                return
+
+            # ⭐ 先补发缓存的音频，再挂到 self.asr 上。
+            #    顺序反了的话，断句线程看到 self.asr 就以为可以收尾，
+            #    但缓存里的头几百毫秒还没送进去 → 丢字。
+            pending = self.pending_pcm
+            self.pending_pcm = []
+            for b in pending:
+                try:
+                    asr.feed(b)
+                except Exception:
+                    break
+
+            self.asr = asr
+
+        threading.Thread(target=run, daemon=True).start()
 
     def _leave_awake(self) -> None:
         self.state = "idle"
         self.speaking = False
         self.seg_buf = []
-        if self.asr:
-            try:
-                self.asr.close()
-            except Exception:
-                pass
-            self.asr = None
+        self.pending_pcm = []
+        self.asr_gen += 1
+        asr = self.asr
+        self.asr = None
+        if asr is not None:
+            threading.Thread(target=asr.close, daemon=True).start()
 
     # ---------- 界面 ----------
 

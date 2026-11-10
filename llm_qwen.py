@@ -220,6 +220,138 @@ class LLM:
                         on_delta(delta)
         return "".join(parts)
 
+    # ---------- 带工具的对话 ----------
+
+    def _stream_with_tools(self, messages, tools, on_delta):
+        """流式请求，同时累积文本和工具调用。
+
+        返回 (text, tool_calls)。tool_calls 是 OpenAI 格式的列表。
+
+        流式里的工具调用长这样（按 index 累积）：
+            delta.tool_calls = [{"index":0,"id":"call_x","type":"function",
+                                 "function":{"name":"web_search","arguments":"{\"qu"}}]
+        """
+        payload = {
+            "model": self.model,
+            "messages": messages,
+            "stream": True,
+        }
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+
+        text_parts: list[str] = []
+        calls: dict[int, dict] = {}
+
+        with self._post(payload) as r:
+            for raw in r:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line or not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    break
+                try:
+                    obj = json.loads(data)
+                    delta = obj["choices"][0].get("delta", {})
+                except Exception:
+                    continue
+
+                content = delta.get("content")
+                if content:
+                    text_parts.append(content)
+                    if on_delta:
+                        on_delta(content)
+
+                for tc in delta.get("tool_calls") or []:
+                    idx = tc.get("index", 0)
+                    slot = calls.setdefault(idx, {
+                        "id": "",
+                        "type": "function",
+                        "function": {"name": "", "arguments": ""},
+                    })
+                    if tc.get("id"):
+                        slot["id"] = tc["id"]
+                    fn = tc.get("function") or {}
+                    if fn.get("name"):
+                        slot["function"]["name"] += fn["name"]
+                    if fn.get("arguments"):
+                        slot["function"]["arguments"] += fn["arguments"]
+
+        ordered = [calls[i] for i in sorted(calls)]
+        return "".join(text_parts), ordered
+
+    def chat_with_tools(
+        self,
+        user_text: str,
+        tools,
+        on_delta: Callable[[str], None] | None = None,
+        on_tool: Callable[[str, str], None] | None = None,
+        max_rounds: int = 3,
+    ) -> tuple[str, list[str]]:
+        """带工具的对话。
+
+        tools: 有 .specs() 和 .call(name, args) 的对象（见 tools.py）
+        on_tool: 每次调用工具时回调 (name, 摘要)，用于界面提示
+
+        返回 (回复文本, 用过的工具名列表)
+        """
+        user_text = (user_text or "").strip()
+        if not user_text:
+            return "", []
+
+        messages = [{"role": "system", "content": self.system}]
+        messages.extend(self.history[-(self.max_history * 2):])
+        messages.append({"role": "user", "content": user_text})
+
+        used: list[str] = []
+        final_text = ""
+
+        for round_i in range(max_rounds):
+            last_round = round_i == max_rounds - 1
+            specs = [] if last_round else tools.specs()
+
+            text, calls = self._stream_with_tools(messages, specs, on_delta)
+
+            if not calls:
+                final_text = text
+                break
+
+            # 记录 assistant 的工具调用意图
+            messages.append({
+                "role": "assistant",
+                "content": text or None,
+                "tool_calls": calls,
+            })
+
+            # 执行每个工具
+            for c in calls:
+                name = c["function"]["name"]
+                args = c["function"]["arguments"]
+                used.append(name)
+                if on_tool:
+                    on_tool(name, args)
+                try:
+                    res = tools.call(name, args)
+                    content = res.as_message()
+                except Exception as e:
+                    content = f"（工具异常：{e}）"
+                messages.append({
+                    "role": "tool",
+                    "tool_call_id": c.get("id") or name,
+                    "content": content,
+                })
+        else:
+            # 轮次用尽还没收敛 → 再来一次纯文本
+            final_text = self._request_stream(
+                {"model": self.model, "messages": messages, "stream": True},
+                on_delta,
+            )
+
+        self.history.append({"role": "user", "content": user_text})
+        self.history.append({"role": "assistant", "content": final_text or "（无回复）"})
+        return final_text, used
+
 
 def main() -> int:
     p = argparse.ArgumentParser()

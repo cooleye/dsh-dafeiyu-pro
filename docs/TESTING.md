@@ -153,44 +153,35 @@ python phase2_listen.py
 
 ---
 
-## 测试五：完整语音对话（推荐！Phase 3）
+## 测试五：分级路由助手（Phase 4，最强！）
 
 ```powershell
-python phase3_chat.py
+python phase4_assistant.py
 ```
 
-**这个是真·聊天了**——它会听懂、会思考、会开口回答。
+**这个会自己判断该聊还是该干活。**
+
+| 你说 | 它会 |
+|---|---|
+| 「你好呀」 | 直接聊（0.5~1 秒） |
+| 「今天北京天气怎么样」 | 自己搜网，用真实数据答（1~2 秒） |
+| 「帮我写一个 Python 脚本」 | 先应一声「好的，我看看」，再交给 DSH agent |
 
 **操作**：
-1. 说 **「大肥鱼」** → 回「我在」，图标 👂
-2. 说一句话，比如「用两句话介绍你自己」
-3. 看到 `💬 你说：...` → `🤔 思考中` → `🐟 哼，本鱼是...`
-4. **它会念出来**（图标变 🗣）
+1. 说 **「大肥鱼」**
+2. 试这几句，观察图标变化：
+   - `👂` 听 → `🤔` 想 → `🐟` 出字 → `🗣` 念
+   - 派活时变 `⚙️`，会先听到「好的，我看看」
+3. 任务超过 8 秒会再补一句「这个要花点时间，你先忙别的」
 
-**打断**：它念的时候你直接说话，它立刻闭嘴听你说。
-
-**换音色**：
+**关掉 agent**（只聊天 + 搜索）：
 ```powershell
-python phase3_chat.py --voice Serena
-python phase3_chat.py --voice Chelsie
-python phase3_chat.py --voice Ethan
+python phase4_assistant.py --no-agent
 ```
 
-**换模型**：
+**调垫场延迟**：
 ```powershell
-python phase3_chat.py --llm qwen-plus
-python phase3_chat.py --llm qwen-max
-```
-
-**关掉打断**（如果你觉得误触发）：
-```powershell
-python phase3_chat.py --no-bargein
-```
-
-**自定义人设**：
-```powershell
-python phase3_chat.py --persona "你是一只高冷的猫，说话不超过十个字"
-python phase3_chat.py --persona-file mypersona.txt
+python phase4_assistant.py --stall 5
 ```
 
 **效果参考**：
@@ -200,19 +191,46 @@ python phase3_chat.py --persona-file mypersona.txt
   🔊 「我在」
   👂 在听...
 
- 🔴 0.210
-  📤 断句（2100ms），等识别结果 ...
-  💬 你说：用两句话介绍你自己
+ 🔴 0.180
+  📤 断句（2000ms），等识别结果 ...
+  💬 你说：今天北京天气怎么样
+  🧭 分流：data（命中数据模式，置信度 80%）
 
-  🤔 思考中 ...
-  🐟 哼，本鱼是大肥鱼，圆滚滚软乎乎的胖鱼。
-  [0.33s 首字 / 0.57s 生成 / 2 句]
-  🗣 播放中...
+  🐟
+  🔧 web_search {"query": "北京 天气 2026年11月10日"}
+哼，本鱼查过了，今天北京天气是晴天，气温14到-1度……
+  [0.35s 首字 / 1.34s 生成 / 2 句 / 工具 ['web_search']]
 ```
+
+**派活的效果**：
+```
+  💬 你说：帮我写一个说明文档
+  🧭 分流：task（命中任务模式，置信度 85%）
+  🔊 垫场1：「好的，我看看」
+  🚀 派给 DSH agent：帮我写一个说明文档
+  🔊 垫场2：「这个要花点时间，你先忙别的」
+
+  ✅ 任务完成，23.4 秒
+
+  📄 要念的内容：文档已经写好了，放在……
+```
+
+> ⚠️ DSH agent 需要 `DEEPSEEK_API_KEY`，本项目会自动从 `apikey.txt` 的
+> `deepseek:` 那行注入。
 
 ---
 
-## 测试六：不用麦克风，验证对话管线
+## 测试六：完整语音对话（Phase 3）
+
+```powershell
+python phase3_chat.py
+```
+
+不带路由的纯聊天版。想简单点聊就用这个。
+
+---
+
+## 测试七：不用麦克风，验证对话管线
 
 ```powershell
 python test_phase3.py --say "你是谁"
@@ -220,40 +238,34 @@ python test_phase3.py --say "讲个笑话" --voice Serena
 python test_phase3.py --no-audio          # 只测 LLM，不合成不播放
 ```
 
-这个不需要麦克风，直接验证「文字 → LLM → 分句 → TTS → 播放」整条链。
+---
+
+## 测试八：跑自动化测试
+
+不需要麦克风、不联网（除了最后一个加 `--live`）：
+
+```powershell
+python test_phase2.py        # ASR 会话状态机
+python test_chatloop.py      # 分句逻辑
+python test_phase4.py        # 分流 + 垫场 + 结果清洗
+python test_phase4.py --live # 额外跑一次真实 DSH agent
+```
+
+应该都是 **全绿**。改完代码跑一下，防止回归。
 
 ---
 
-## 测试七：只听 ASR（不用唤醒词）
+## 测试九：单独测各组件
 
 ```powershell
-python asr_aliyun.py --mic
-```
-
-直接说话就识别，不用先叫名字。适合单独验证 ASR 效果。
-
-**用文件测**（不用麦克风）：
-```powershell
-python asr_aliyun.py --wav "D:\project\desk-ai\.kws-download\asr-test.wav"
-```
-
----
-
-## 测试八：单独测 TTS
-
-```powershell
-python tts_qwen.py --say "你好，我是大肥鱼"
-python tts_qwen.py --say "我在生气" --instruct "用生气的语气说"
-python tts_qwen.py --say "..." --voice Serena --out test.wav
-```
-
----
-
-## 测试九：单独测 LLM
-
-```powershell
-python llm_qwen.py --ask "今天天气怎么样"
-python llm_qwen.py --chat               # 交互式多轮，输入 exit 退出
+python asr_aliyun.py --mic                    # 只测 ASR
+python asr_aliyun.py --wav test.wav           # 用文件测 ASR
+python tts_qwen.py --say "你好"                # 只测 TTS
+python llm_qwen.py --ask "你好"                # 只测 LLM
+python tools.py --search "今天天气"            # 只测搜索
+python tools.py --time                         # 只测时间
+python router.py                               # 看分流规则效果
+python dsh_agent.py "任务描述"                  # 只测 DSH agent
 ```
 
 ---
@@ -370,12 +382,17 @@ py phase1_wake_reply.py
 | 测唤醒词 | `python phase0_kws_poc.py` |
 | 唤醒+回应 | `python phase1_wake_reply.py` |
 | 唤醒+听写 | `python phase2_listen.py` |
-| **完整语音对话** | `python phase3_chat.py` |
+| 纯聊天 | `python phase3_chat.py` |
+| **分级路由助手** | `python phase4_assistant.py` |
 | 只测对话管线 | `python test_phase3.py --say "你是谁"` |
 | 换音色 | `python phase3_chat.py --voice Serena` |
+| 跑全部测试 | `python test_phase2.py; python test_chatloop.py; python test_phase4.py` |
 | 只测 ASR | `python asr_aliyun.py --mic` |
 | 只测 TTS | `python tts_qwen.py --say "你好"` |
 | 只测 LLM | `python llm_qwen.py --ask "你好"` |
+| 只测搜索 | `python tools.py --search "今天天气"` |
+| 看分流效果 | `python router.py` |
+| 只测 agent | `python dsh_agent.py "任务"` |
 | 查配置 | `python voice_config.py` |
 | 录一段 | `python record_wav.py test.wav -d 3` |
 | 采样本 | `python collect_samples.py pos --count 10` |

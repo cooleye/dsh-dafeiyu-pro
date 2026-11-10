@@ -156,6 +156,16 @@ class VoiceLoop:
             print(f"\n\n=== 共识别 {len(self.transcripts)} 句 ===")
             for i, t in enumerate(self.transcripts, 1):
                 print(f"  {i}. {t}")
+        except OSError as e:
+            # 最常见：麦克风被别的程序独占
+            # WDM-KS 是独占模式，终端版和桌宠版不能同时开麦
+            print(f"\n\n  ❌ 打开麦克风失败：{e}")
+            print("     多半是被别的程序占着了。检查：")
+            print("       · 终端里是不是还开着 phase4_assistant.py / phase2_listen.py")
+            print("       · 桌宠插件是不是已经启用了语音")
+            print("       · 微信 / QQ 语音、浏览器录音标签页")
+            print("     WDM-KS 是独占模式，同一时间只能有一个程序用。")
+            raise
 
     def _tick(self, frame: np.ndarray) -> None:
         # 重采样到 16k

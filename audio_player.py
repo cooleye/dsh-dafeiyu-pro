@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import collections
+import os
 import threading
 import time
 import wave
@@ -24,6 +25,55 @@ from pathlib import Path
 
 import numpy as np
 import sounddevice as sd
+
+# 输出设备的选择可以写在文件里，改完重启语音服务就生效（不用重启 DSH）。
+#   · 全数字        → 当设备编号
+#   · 其它字符串    → 按名字模糊匹配（设备编号会变，名字不会）
+#   · 文件不存在/空 → 用系统默认
+OUTPUT_DEVICE_FILE = Path(
+    os.environ.get("DSH_DAFEIYU_OUTPUT_DEVICE_FILE")
+    or str(Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "dsh-dafeiyu" / "output-device.txt")
+)
+
+
+def read_output_device_setting() -> str:
+    try:
+        # ⚠️ 用 PowerShell 的 Set-Content -Encoding UTF8 写会带 BOM，
+        #    不剥掉的话名字匹配永远失败（踩过）。
+        return OUTPUT_DEVICE_FILE.read_text(encoding="utf-8-sig").strip()
+    except (OSError, ValueError):
+        return ""
+
+
+def resolve_output_device(value: int | str | None = None) -> int | None:
+    """把「设备编号 / 设备名 / 空」解析成 sounddevice 的设备索引。
+
+    ⚠️ 为什么要能按名字选：
+    这台机器上有 30 多个输出设备（蓝牙耳机、HDMI、网易虚拟音频、Senary…），
+    编号每次插拔都会变；而且 PortAudio 对没接上的设备也会「播放成功」，
+    所以默认设备选错了根本没有任何报错 —— 就是单纯没声音。
+    """
+    if isinstance(value, int):
+        return value
+
+    text = (value or "").strip() or read_output_device_setting()
+    if not text:
+        return None
+
+    if text.isdigit():
+        return int(text)
+
+    lowered = text.lower()
+    try:
+        devices = sd.query_devices()
+    except Exception:
+        return None
+    for index, device in enumerate(devices):
+        if device["max_output_channels"] <= 0:
+            continue
+        if lowered in device["name"].lower():
+            return index
+    return None
 
 
 class Player:
@@ -36,8 +86,9 @@ class Player:
     另一个线程里调 player.stop() 就立即停止。
     """
 
-    def __init__(self, device: int | None = None):
-        self.device = device
+    def __init__(self, device: int | str | None = None):
+        self.device = resolve_output_device(device)
+        self.device_name = self._describe(self.device)
         self._stop_event = threading.Event()
         self._playing = False
         self._lock = threading.Lock()
@@ -53,6 +104,33 @@ class Player:
     def level_series(self, since: float) -> list[tuple[float, float]]:
         """取出 since 之后的播放音量采样。"""
         return [(t, r) for t, r in list(self._levels) if t >= since]
+
+    @staticmethod
+    def _describe(device: int | None) -> str:
+        try:
+            if device is None:
+                return "系统默认"
+            return str(sd.query_devices(device)["name"])
+        except Exception:
+            return "未知"
+
+    def _open_stream(self, sample_rate: int, block: int):
+        """打开输出流；配置的设备打不开就退回系统默认。
+
+        PortAudio 对没接上的设备也可能「成功」但不发声，
+        所以这里只兜住真正抛异常的情况（设备被拔掉、被独占）。
+        """
+        try:
+            return sd.OutputStream(samplerate=sample_rate, channels=1,
+                                   dtype="float32", device=self.device, blocksize=block)
+        except Exception:
+            if self.device is None:
+                raise
+            print(f"  ⚠️ 输出设备「{self.device_name}」打不开，退回系统默认")
+            self.device = None
+            self.device_name = "系统默认"
+            return sd.OutputStream(samplerate=sample_rate, channels=1,
+                                   dtype="float32", device=None, blocksize=block)
 
     def stop(self) -> None:
         """请求停止当前播放。立即返回，实际停止在下一个音频块。"""
@@ -81,13 +159,7 @@ class Player:
         self._levels.clear()
 
         try:
-            stream = sd.OutputStream(
-                samplerate=sample_rate,
-                channels=1,
-                dtype="float32",
-                device=self.device,
-                blocksize=block,
-            )
+            stream = self._open_stream(sample_rate, block)
             with stream:
                 pos = 0
                 while pos < total:

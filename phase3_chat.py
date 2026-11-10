@@ -113,10 +113,11 @@ class Speaker:
     这样第一句合成完就能开口，不用等整段回复。
     """
 
-    def __init__(self, api_key: str, voice: str = "Cherry"):
+    def __init__(self, api_key: str, voice: str = "Cherry", output_device=None):
         self.api_key = api_key
         self.voice = voice
-        self.player = Player()
+        self.player = Player(output_device)
+        print(f"  🔊 输出设备：{self.player.device_name}")
         self.q: queue.Queue = queue.Queue()
         self.stop_flag = threading.Event()
         self.busy = False            # 正在说话（给打断检测用）

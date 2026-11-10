@@ -44,7 +44,10 @@ DSH_CMD_CANDIDATES = [
     "dsh",
 ]
 
-DEFAULT_TIMEOUT = 180.0
+# agent 一次能干不少活，而且它自己会做校验（有时还会用 Word 打开看一眼），
+# 180 秒实测不够：查新闻 + 写 docx 那次跑到 180 秒被我们杀了，
+# 但文件其实已经写好了 —— 白报一次失败。
+DEFAULT_TIMEOUT = 300.0
 
 
 def find_dsh() -> str:
@@ -190,7 +193,10 @@ class DshAgent:
             t_err.join(timeout=2)
             t_out.join(timeout=2)
             self._proc = None
-            return False, f"超时（{self.timeout:.0f} 秒），已终止"
+            return False, (
+                f"跑超过 {self.timeout:.0f} 秒了，我已经把它停了。"
+                "要是它已经在收尾，文件可能其实已经生成了——先去看看再说。"
+            )
 
         t_err.join(timeout=3)
         t_out.join(timeout=3)

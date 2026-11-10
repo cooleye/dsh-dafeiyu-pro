@@ -45,6 +45,25 @@ TASK_PATTERNS = [
     r"(保存|存|导出)到(电脑|本地|桌面)",
 ]
 
+# ---------- 文件/桌面操作（必须交给 agent）----------
+# 这一类最容易出事：模型没有文件系统，如果判成 data 走「带工具聊天」，
+# 它会一本正经地说「已经帮你建好/删掉了」——实际上什么都没做。
+# 所以只要「动作 + 目标」同时出现，一律判 task。
+FILE_TARGETS = (
+    r"(文件|文档|文件夹|目录|桌面|桌面上的|txt|docx?|word|excel|xlsx|ppt|pptx|pdf|"
+    r"图片|截图|压缩包|exe|word文档|excel表格)"
+)
+FILE_ACTIONS = (
+    r"(创建|新建|建一?个|生成|删除|删掉|删了|删一下|移除|清空|"
+    r"重命名|改名|移动|挪到|复制|拷贝|"
+    r"写入|写到|写进|保存|存到|存进|导出|下载到|"
+    r"打开|读取|读一下|列出|列一下|整理到|扫描)"
+)
+FILE_ACTION_PATTERNS = [
+    rf"{FILE_ACTIONS}.{{0,12}}{FILE_TARGETS}",
+    rf"{FILE_TARGETS}.{{0,12}}{FILE_ACTIONS}",
+]
+
 # ---------- 数据类 ----------
 # 需要联网查，但一句话就能答
 DATA_PATTERNS = [
@@ -135,6 +154,11 @@ def classify(text: str, force: str = "") -> Route:
     m = _match(TASK_PATTERNS, raw)
     if m:
         return Route("task", "命中任务模式", 0.85, m.group(0))
+
+    # 2.5) 文件/桌面操作 —— 一定得真动手，不能交给「带工具聊天」
+    m = _match(FILE_ACTION_PATTERNS, raw)
+    if m:
+        return Route("task", "文件/桌面操作", 0.9, m.group(0))
 
     # 3) 数据类
     m = _match(DATA_PATTERNS, raw)

@@ -433,6 +433,48 @@ def t_persona_time_is_live() -> bool:
     return ok
 
 
+def t_route_file_actions() -> bool:
+    """文件/桌面操作必须判成 task。
+
+    踩过的坑：这类句子掉进 data 兜底（带工具聊天），
+    模型没有文件系统，就一本正经回「已经帮你建好/删掉了」，
+    实际什么都没做 —— 用户以为功能坏了。
+    """
+    from router import classify
+
+    must_task = [
+        "帮我在桌面创建一个空白的txt文档",
+        "你帮我把桌面刚刚创建那个给你的诗那个文件给我删掉",
+        "把桌面那个 test.docx 删了",
+        "帮我把桌面上的文件重命名",
+        "帮我写首诗，然后给我存到桌面上",
+    ]
+    must_not_task = [
+        "今天有什么新闻啊？",
+        "帮我查一下最近的新闻",
+        "现在几点了",
+        "陪我聊会儿天",
+        "你叫什么名字",
+    ]
+
+    bad = []
+    for s in must_task:
+        r = classify(s)
+        if r.kind != "task":
+            bad.append(f"漏判 task：{s} → {r.kind}")
+    for s in must_not_task:
+        r = classify(s)
+        if r.kind == "task":
+            bad.append(f"误判 task：{s} → {r.kind}")
+
+    ok = not bad
+    print(f"\n[文件操作分流]  {'✅' if ok else '❌'}")
+    print(f"  应判任务 {len(must_task)} 条 / 不该判 {len(must_not_task)} 条")
+    for b in bad:
+        print(f"    {b}")
+    return ok
+
+
 def t_no_permission_needed() -> bool:
     """普通任务（不写外部文件）→ 不该问，直接用沙箱跑。"""
     app = make_app()
@@ -557,6 +599,7 @@ def main() -> int:
         t_farewell_silences_late_reply(),
         t_farewell_cancels_task(),
         t_persona_time_is_live(),
+        t_route_file_actions(),
         t_no_permission_needed(),
         t_barge_in(),
         t_barge_in_grace(),

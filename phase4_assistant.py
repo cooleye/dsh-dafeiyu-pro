@@ -363,8 +363,10 @@ class Assistant:
         if self.allow_full_access or not self.ask_permission:
             return False
 
-        write_hints = ["保存", "写到", "存到", "放到", "创建一个", "新建", "生成一个文件",
-                       "导出", "下载到", "改一下这个文件"]
+        write_hints = ["保存", "写到", "存到", "放到", "创建一个", "创建", "新建",
+                       "生成一个文件", "导出", "下载到", "改一下这个文件",
+                       # 删除/改名/移动同样要动工作区外的文件系统
+                       "删除", "删掉", "删了", "清空", "移除", "重命名", "改名", "移动"]
         outside_hints = ["桌面", "desktop", "文档", "下载", "图片", "D:", "C:",
                          "我的电脑", "文件夹"]
         has_write = any(w in task for w in write_hints)
@@ -600,8 +602,9 @@ class Assistant:
                 # 区分「被取消」和「失败」
                 if "取消" in output:
                     self._say("好，停了")
-                elif "超时" in output:
-                    self._say("这个任务太久没跑完，我放弃了")
+                elif "超时" in output or "跑超过" in output:
+                    # 超时不一定真失败：实测有次文件已经写好，只是它在收尾校验
+                    self._say("跑太久了，我先停了。你去看看文件是不是已经在了")
                 else:
                     self._say("呜……这个任务没做成")
 

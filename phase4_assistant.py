@@ -71,7 +71,9 @@ STALL_DELAY = 8.0
 PERMISSION_ASK = "这个任务可能要写文件，允许我操作吗？说允许，或者说不"
 PERMISSION_OK_WORDS = ["允许", "可以", "好的", "行", "同意", "准了", "授权"]
 PERMISSION_NO_WORDS = ["不", "不行", "拒绝", "别", "不要", "算了"]
-PERMISSION_TIMEOUT = 12.0
+PERMISSION_TIMEOUT = 25.0
+PERMISSION_ON_MORE_TIME = "还在等你答复，说允许或者说不"
+PERMISSION_FALLBACK = "没听到答复，我先在沙箱里做，文件会存在工作区"
 
 # ---------- 停止任务 ----------
 STOP_TASK_WORDS = [
@@ -223,6 +225,7 @@ class Assistant:
         self.allow_full_access = allow_full_access
         self._pending_task: str | None = None
         self._perm_deadline = 0.0
+        self._perm_retries = 0
 
         self.loop = VoiceLoop(
             api_key=api_key,
@@ -329,6 +332,7 @@ class Assistant:
         """用户对「允许吗」的答复。"""
         task = self._pending_task
         self._pending_task = None
+        self._perm_retries = 0
         low = text.strip()
 
         if any(w in low for w in PERMISSION_NO_WORDS) and not any(
@@ -348,6 +352,7 @@ class Assistant:
         self._say("我没听清，你说允许还是不允许")
         self._pending_task = task
         self._perm_deadline = time.time() + PERMISSION_TIMEOUT
+        self._arm_permission_timeout(task or "")
 
     def _needs_permission(self, task: str) -> bool:
         """判断这个任务要不要升权。
@@ -473,6 +478,11 @@ class Assistant:
 
                 flush(buf)
                 ttft = (first[0] - t0) if first[0] else 0
+                # 回复原文也记进日志 —— 不然「答错了」根本无从查起
+                self.ev.log(
+                    f"💬 回复（用了 {used or '无工具'}）："
+                    f"{reply.strip()[:160]}{'…' if len(reply.strip()) > 160 else ''}"
+                )
                 self.ev.reply_end(ttft=ttft, total=time.time() - t0,
                                   sentences=len(spoken), tools=used,
                                   text=reply)
@@ -495,17 +505,41 @@ class Assistant:
             self._say(PERMISSION_ASK)
             self._pending_task = text
             self._perm_deadline = time.time() + PERMISSION_TIMEOUT
-            # 超时视为拒绝
-            def timeout_check():
-                time.sleep(PERMISSION_TIMEOUT + 0.5)
-                if self._pending_task == text:
-                    self._pending_task = None
-                    self.ev.log("⏱ 权限确认超时，按拒绝处理")
-                    self._say("没等到你答复，那我先不动了")
-            threading.Thread(target=timeout_check, daemon=True).start()
+            self._perm_retries = 0
+            self._arm_permission_timeout(text)
             return
 
         self._run_task(text, granted=False)
+
+    def _arm_permission_timeout(self, text: str) -> None:
+        """挂一个超时检查。
+
+        ⚠️ 超时**不再直接拒绝**：实机上用户经常在 12 秒内没反应过来
+        （或者在听 TTS 念提示），任务就被判死，然后回「没等到你答复」，
+        用户以为插件坏了。真实反馈就是「创建文档那个功能没了」。
+
+        现在：第一次超时再问一遍，第二次超时降级成沙箱跑（至少把活干了）
+        并说清楚文件存哪了。
+        """
+        def check():
+            time.sleep(PERMISSION_TIMEOUT + 0.5)
+            if self._pending_task != text:
+                return          # 已经答复了
+            if self._perm_retries < 1:
+                self._perm_retries += 1
+                self._perm_deadline = time.time() + PERMISSION_TIMEOUT
+                self.ev.log("⏳ 还没答复，再问一次")
+                self._say(PERMISSION_ON_MORE_TIME)
+                self._arm_permission_timeout(text)
+                return
+
+            # 两次都没答 → 按沙箱跑，别把活丢了
+            self._pending_task = None
+            self.ev.log("⏱ 两次没答复，改用沙箱直接跑")
+            self._say(PERMISSION_FALLBACK)
+            self._run_task(text, granted=False)
+
+        threading.Thread(target=check, daemon=True).start()
 
     def _run_task(self, text: str, granted: bool) -> None:
         self.agent_busy = True

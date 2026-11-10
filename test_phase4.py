@@ -408,6 +408,31 @@ def t_farewell_cancels_task() -> bool:
     return ok
 
 
+def t_persona_time_is_live() -> bool:
+    """系统提示词里的时间必须每次现算。
+
+    踩过的坑：时间在 LLM 构造时算一次就冻住了，
+    语音服务跑几小时后它还在说启动那一刻的时间，
+    连带着拿错的日期去搜天气，搜回来的是旧天气。
+    """
+    from llm_qwen import LLM, Persona
+
+    base = Persona.build()
+    line = Persona.time_line()
+    llm = LLM("fake-key", model="qwen-flash")
+    system_now = llm._system_now()
+
+    ok = (
+        "当前时间" not in base            # 人设里不许带时间
+        and "当前时间" in line
+        and "当前时间" in system_now      # 但每次请求时要有
+        and line in system_now
+    )
+    print(f"\n[时间不冻结]  {'✅' if ok else '❌'}")
+    print(f"  build() 含时间={('当前时间' in base)}  _system_now() 含时间={('当前时间' in system_now)}")
+    return ok
+
+
 def t_no_permission_needed() -> bool:
     """普通任务（不写外部文件）→ 不该问，直接用沙箱跑。"""
     app = make_app()
@@ -531,6 +556,7 @@ def main() -> int:
         t_farewell_flow(),
         t_farewell_silences_late_reply(),
         t_farewell_cancels_task(),
+        t_persona_time_is_live(),
         t_no_permission_needed(),
         t_barge_in(),
         t_barge_in_grace(),

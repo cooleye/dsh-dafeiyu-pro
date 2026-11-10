@@ -79,14 +79,22 @@ class Persona:
         if extra.strip():
             parts.append(extra.strip())
 
+        return "\n\n".join(parts)
+
+    @staticmethod
+    def time_line() -> str:
+        """当前时间，**每次调用都现算**。
+
+        不要把它塞进 build() 的结果里缓存起来 —— 语音服务会跑很久，
+        缓存下来就一直在说启动那一刻的时间。
+        """
         now = time.localtime()
         weekday = "一二三四五六日"[now.tm_wday]
-        parts.append(
+        return (
             f"当前时间：{now.tm_year}年{now.tm_mon}月{now.tm_mday}日 "
-            f"星期{weekday} {now.tm_hour:02d}:{now.tm_min:02d}"
+            f"星期{weekday} {now.tm_hour:02d}:{now.tm_min:02d}。"
+            "用户问时间、日期时以这个为准，不要凭记忆猜。"
         )
-
-        return "\n\n".join(parts)
 
 
 class LLM:
@@ -114,6 +122,16 @@ class LLM:
     def reset(self) -> None:
         self.history.clear()
 
+    def _system_now(self) -> str:
+        """拼系统提示词：人设 + **此刻**的时间。
+
+        ⚠️ 时间必须每次现算，不能存在 self.system 里。
+        语音服务一开就是几小时，构造时算一次会一直说启动那一刻的时间，
+        连带着模型拿错的日期去搜天气，搜回来的也是旧天气。
+        这是实打实踩过的坑。
+        """
+        return f"{self.system}\n\n{Persona.time_line()}"
+
     def chat(
         self,
         user_text: str,
@@ -128,7 +146,7 @@ class LLM:
         if not user_text:
             return ""
 
-        messages = [{"role": "system", "content": self.system}]
+        messages = [{"role": "system", "content": self._system_now()}]
         messages.extend(self.history[-(self.max_history * 2):])
         messages.append({"role": "user", "content": user_text})
 
@@ -300,7 +318,7 @@ class LLM:
         if not user_text:
             return "", []
 
-        messages = [{"role": "system", "content": self.system}]
+        messages = [{"role": "system", "content": self._system_now()}]
         messages.extend(self.history[-(self.max_history * 2):])
         messages.append({"role": "user", "content": user_text})
 

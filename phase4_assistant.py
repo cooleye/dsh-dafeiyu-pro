@@ -30,6 +30,7 @@
 from __future__ import annotations
 
 import argparse
+import collections
 import math
 import re
 import sys
@@ -74,6 +75,15 @@ PERMISSION_NO_WORDS = ["不", "不行", "拒绝", "别", "不要", "算了"]
 PERMISSION_TIMEOUT = 25.0
 PERMISSION_ON_MORE_TIME = "还在等你答复，说允许或者说不"
 PERMISSION_FALLBACK = "没听到答复，我先在沙箱里做，文件会存在工作区"
+
+# ---------- 回声判定（防自己打断自己）----------
+# 没有 AEC，扬声器漏进麦克风的回声实测比用户正常说话还响
+# （回声 0.06~0.19 vs 说话 0.026~0.058），所以不能靠阈值区分。
+# 改看「麦克风音量跟不跟播放音量走」：回声跟，真人说话不跟。
+BARGE_IN_CORR_WINDOW = 1.0      # 取最近多少秒的两条曲线做相关
+BARGE_IN_ECHO_LAG = 0.08        # 声音从扬声器到麦克风的延迟估计
+BARGE_IN_ECHO_CORR = 0.5        # 相关系数高于此判为回声
+BARGE_IN_PLAY_MIN = 0.01        # 播放音量低于此，谈不上回声
 
 # ---------- 停止任务 ----------
 STOP_TASK_WORDS = [
@@ -215,6 +225,8 @@ class Assistant:
         self.thinking = False
         self.current_route: Route | None = None
         self._loud_frames = 0
+        # 麦克风音量曲线：跟播放曲线做相关，判断「是不是自己的回声」
+        self._mic_levels: collections.deque[tuple[float, float]] = collections.deque(maxlen=40)
         self._last_state: str | None = None
         self._task_started = 0.0
         # 是否处于唤醒态。退下后置 False，LLM/任务线程还在跑也不会再说话。
@@ -248,20 +260,90 @@ class Assistant:
     # ---------- 打断 ----------
 
     def _check_barge_in(self, rms: float) -> None:
-        """播放期间一开口就闭嘴（不等 ASR）。"""
+        """播放期间一开口就闭嘴（不等 ASR）。
+
+        ⚠️ 这里最大的坑是「自己打断自己」。
+        没有 AEC，扬声器的声音会漏进麦克风；实测回声 RMS 0.06~0.19，
+        甚至比用户正常说话（0.026~0.058）还响 —— 光调阈值根本没用：
+        调高到盖过回声，真打断就永远触发不了。
+
+        所以不比绝对值，比「跟不跟播放音量走」：
+          回声 = 播放的延迟副本 → 两条曲线高度同步（相关系数高）
+          人说话 = 独立声源     → 不同步（相关系数低）
+        相关系数高就判成回声，不打断。
+        """
+        now = time.monotonic()
+        self._mic_levels.append((now, rms))
+
         if not self.speaker.busy:
             self._loud_frames = 0
             return
         if (time.time() - self.speaker.started_at) * 1000 < BARGE_IN_GRACE_MS:
             return
-        if rms > BARGE_IN_RMS:
-            self._loud_frames += 1
-            if self._loud_frames >= BARGE_IN_FRAMES:
-                print(f"\n  🤐 打断（音量 {rms:.3f}），停止播报\n")
-                self.speaker.stop()
-                self._loud_frames = 0
-        else:
+
+        if rms <= BARGE_IN_RMS:
             self._loud_frames = 0
+            return
+
+        # 麦克风响，但这声音是不是自己的回声？
+        play_level = self._play_level(now)
+        if play_level < BARGE_IN_PLAY_MIN:
+            # 播放本身很轻，麦克风却这么响 → 确实是用户在说
+            is_echo = False
+            corr = None
+        else:
+            corr = self._echo_correlation(now)
+            # 样本不够时算不出相关 —— 播放正响着，宁可当成回声，
+            # 因为误判的代价是「机器把自己打断」，比漏判难看得多。
+            is_echo = corr is None or corr > BARGE_IN_ECHO_CORR
+
+        if is_echo:
+            self._loud_frames = 0
+            if rms > 0.05:
+                c = "?" if corr is None else f"{corr:.2f}"
+                self.ev.log(f"🔇 回声（相关 {c}，播放 {play_level:.3f}），不打断")
+            return
+
+        self._loud_frames += 1
+        if self._loud_frames >= BARGE_IN_FRAMES:
+            print(f"\n  🤐 打断（音量 {rms:.3f}，播放 {play_level:.3f}），停止播报\n")
+            self.speaker.stop()
+            self._loud_frames = 0
+
+    def _play_level(self, now: float) -> float:
+        """最近这段时间里播放过的最大音量。"""
+        series = self.speaker.player.level_series(now - BARGE_IN_CORR_WINDOW)
+        return max((r for _, r in series), default=0.0)
+
+    def _echo_correlation(self, now: float) -> float | None:
+        """麦克风音量 vs 播放音量 的相关系数。
+
+        返回 None 表示样本不够，调用方按「当成回声」处理。
+        """
+        window = BARGE_IN_CORR_WINDOW
+        since = now - window
+
+        mic = [(t, r) for t, r in list(self._mic_levels) if t >= since]
+        play = self.speaker.player.level_series(since - BARGE_IN_ECHO_LAG)
+        if len(mic) < 4 or len(play) < 4:
+            return None
+
+        # 把播放曲线对齐到麦克风的采样时刻（各取最近的一个）
+        xs: list[float] = []
+        ys: list[float] = []
+        for t, r in mic:
+            nearest = min(play, key=lambda p: abs(p[0] - (t - BARGE_IN_ECHO_LAG)))
+            xs.append(nearest[1])
+            ys.append(r)
+
+        mx = sum(xs) / len(xs)
+        my = sum(ys) / len(ys)
+        vx = sum((x - mx) ** 2 for x in xs)
+        vy = sum((y - my) ** 2 for y in ys)
+        if vx <= 1e-12 or vy <= 1e-12:
+            return None
+        cov = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
+        return cov / ((vx ** 0.5) * (vy ** 0.5))
 
     # ---------- 主流程 ----------
 
@@ -633,6 +715,10 @@ class Assistant:
         if name != getattr(self, "_last_state", None):
             self._last_state = name
             self.ev.state(name)
+
+        # 它在说话时屏蔽识别（没有 AEC，麦克风会录到自己的声音）。
+        # 音量上报不受影响，打断照常能检测。
+        self.loop.suppress_input = self.speaker.busy
 
         # 每 3 秒把音量记进日志（排查「叫了没反应」全靠这个）
         now = time.time()

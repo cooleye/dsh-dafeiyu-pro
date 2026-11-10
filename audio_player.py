@@ -16,6 +16,7 @@ Phase 1 核心组件。设计要点：
 from __future__ import annotations
 
 import argparse
+import collections
 import threading
 import time
 import wave
@@ -40,10 +41,18 @@ class Player:
         self._stop_event = threading.Event()
         self._playing = False
         self._lock = threading.Lock()
+        # 播放音量曲线：(单调时钟, 该音频块 RMS)。
+        # 用途：判断麦克风里的声音是「自己漏出去的」还是「用户真的在说」。
+        # 回声的音量会跟着这条曲线走，真人的声音不会。
+        self._levels: collections.deque[tuple[float, float]] = collections.deque(maxlen=80)
 
     @property
     def is_playing(self) -> bool:
         return self._playing
+
+    def level_series(self, since: float) -> list[tuple[float, float]]:
+        """取出 since 之后的播放音量采样。"""
+        return [(t, r) for t, r in list(self._levels) if t >= since]
 
     def stop(self) -> None:
         """请求停止当前播放。立即返回，实际停止在下一个音频块。"""
@@ -69,6 +78,7 @@ class Player:
 
         with self._lock:
             self._playing = True
+        self._levels.clear()
 
         try:
             stream = sd.OutputStream(
@@ -88,6 +98,12 @@ class Player:
                     if len(chunk) < block:
                         chunk = np.pad(chunk, (0, block - len(chunk)))
                     stream.write(chunk.reshape(-1, 1))
+                    # 记下这一块的音量（给「回声判定」用）
+                    try:
+                        level = float(np.sqrt(np.mean(chunk.astype(np.float32) ** 2)))
+                    except Exception:
+                        level = 0.0
+                    self._levels.append((time.monotonic(), level))
                     pos += block
             return True
         finally:

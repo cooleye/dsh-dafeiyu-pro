@@ -106,6 +106,10 @@ class VoiceLoop:
         # 每帧上报音量（用于「它说话时你一开口就打断」）
         # 注意：这不是 VAD，是「立即反应」——不等识别完
         self.on_voice_level = None
+        # 播放期间屏蔽断句/识别：没有 AEC，麦克风会把自己的声音也录进来，
+        # 结果它把自己念的话当成用户输入（日志里真的出现过）。
+        # 音量上报不受影响，所以打断检测照常工作。
+        self.suppress_input = False
 
         # KWS
         self.spotter, self.kws_stream = create_spotter(
@@ -266,6 +270,11 @@ class VoiceLoop:
                 self.on_voice_level(rms)
             except Exception:
                 pass
+
+        # 它正在说话：只更新音量（给打断判定用），不做断句/识别。
+        # 否则麦克风里的回声会被当成用户说的话 —— 实测真的发生过。
+        if self.suppress_input:
+            return
 
         if self.state == "idle":
             self._tick_idle(frame)

@@ -21,11 +21,23 @@ sys.path.insert(0, str(HERE))
 
 
 class FakeSpeaker:
+    class _FakePlayer:
+        """没有真实播放：level_series 永远空 → 判定不出回声。"""
+
+        def level_series(self, since):
+            return []
+
     def __init__(self, *a, **kw):
         self.said: list[str] = []
         self.stopped = 0
         self.busy = False
         self.started_at = 0.0
+        self.voice = "Bella"
+        self.player = FakeSpeaker._FakePlayer()
+
+    @property
+    def speaking(self):
+        return self.busy
 
     def say(self, t):
         self.said.append(t)
@@ -475,6 +487,58 @@ def t_route_file_actions() -> bool:
     return ok
 
 
+def t_barge_in_ignores_echo() -> bool:
+    """自己说话漏进麦克风的回声不算打断，真人说话才算。
+
+    踩过的坑：没有 AEC，扬声器回声 RMS 0.06~0.19，
+    比用户正常说话（0.026~0.058）还响，固定阈值必然误判。
+    现在看「麦克风音量跟不跟播放音量走」：
+      回声跟 → 相关系数高 → 不打断
+      真人  → 不相关   → 打断
+    """
+    import time as _t
+
+    app = make_app()
+    app.speaker.busy = True
+    app.speaker.started_at = _t.time() - 5      # 已过起音保护
+
+    class EchoPlayer:
+        def __init__(self):
+            self.data: list[tuple[float, float]] = []
+
+        def level_series(self, since):
+            return [(t, v) for t, v in self.data if t >= since]
+
+    player = EchoPlayer()
+    app.speaker.player = player
+
+    # ① 回声：麦克风音量跟着播放走（同形、略大一点点）
+    pattern = [0.05, 0.12, 0.03, 0.11, 0.04, 0.10, 0.02, 0.09]
+    for p in pattern:
+        now = _t.monotonic()
+        player.data.append((now, p))
+        app._check_barge_in(p * 1.2)      # 回声比播放还响一点，正是实机的情况
+    stopped_on_echo = app.speaker.stopped
+
+    # ② 真人：播放已经安静，麦克风却突然很响（不相关）
+    #    注意 stop() 会把 busy 置 False，这里要重新立起来
+    player.data.clear()
+    app._loud_frames = 0
+    app.speaker.stopped = 0
+    app.speaker.busy = True
+    for _ in range(4):
+        now = _t.monotonic()
+        player.data.append((now, 0.002))   # 几乎没在播
+        app._check_barge_in(0.14)
+    stopped_on_speech = app.speaker.stopped
+
+    ok = stopped_on_echo == 0 and stopped_on_speech >= 1
+    print(f"\n[回声不打断]  {'✅' if ok else '❌'}")
+    print(f"  回声触发停止={stopped_on_echo}（应 0）  "
+          f"真人触发停止={stopped_on_speech}（应 ≥1）")
+    return ok
+
+
 def t_no_permission_needed() -> bool:
     """普通任务（不写外部文件）→ 不该问，直接用沙箱跑。"""
     app = make_app()
@@ -600,6 +664,7 @@ def main() -> int:
         t_farewell_cancels_task(),
         t_persona_time_is_live(),
         t_route_file_actions(),
+        t_barge_in_ignores_echo(),
         t_no_permission_needed(),
         t_barge_in(),
         t_barge_in_grace(),

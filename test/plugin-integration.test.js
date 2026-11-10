@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict'
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { mkdtemp, readFile, rm } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { dirname, join } from 'node:path'
@@ -20,8 +20,11 @@ test('plugin declares the service dependencies it actually consumes', () => {
 })
 
 test('package metadata exposes the DSH web client bundle', () => {
-  const require = createRequire(import.meta.url)
-  const metadata = require('dsh-dafeiyu/package.json')
+  // 本 fork 把包名改成了 dsh-dafeiyu-pro，无法再按原包名 require；
+  // 直接读本仓库的 package.json 更稳，也不依赖 node_modules 里的自链接。
+  const metadata = JSON.parse(
+    readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8'),
+  )
   assert.equal(metadata.exports['./client'], './lib/client.js')
   assert.equal(metadata.dsh.client.platform, 'web')
   assert.deepEqual(metadata.bundleDependencies, [

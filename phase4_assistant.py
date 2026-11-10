@@ -55,6 +55,7 @@ from phase3_chat import (  # noqa: E402
 from router import Route, classify  # noqa: E402
 from tools import Tools  # noqa: E402
 from voice_config import load_keys  # noqa: E402
+from voice_events import BaseEvents, ConsoleEvents  # noqa: E402
 
 # 垫场话术（本地 SAPI，秒回）
 STALL_1 = "好的，我看看"
@@ -124,7 +125,9 @@ class Assistant:
         dialogue_timeout: float = 40.0,
         ask_permission: bool = True,
         allow_full_access: bool = False,
+        events: BaseEvents | None = None,
     ):
+        self.ev = events or ConsoleEvents()
         self.llm = LLM(api_key, model=llm_model)
         self.tools = Tools(search_key)
         self.speaker = Speaker(api_key, voice)
@@ -137,6 +140,7 @@ class Assistant:
         self.thinking = False
         self.current_route: Route | None = None
         self._loud_frames = 0
+        self._last_state: str | None = None
 
         # 权限
         self.ask_permission = ask_permission
@@ -176,22 +180,24 @@ class Assistant:
     # ---------- 主流程 ----------
 
     def run(self) -> None:
-        print("=== 分级路由语音助手 ===\n")
-        print(f"  LLM：{self.llm.model}")
-        print(f"  音色：{self.speaker.voice}")
-        print(f"  DSH agent：{'开' if self.use_agent else '关'}")
-        print(f"  垫场：{self.stall_delay:.0f} 秒后补第二句")
-        print("\n说「大肥鱼」叫醒它。它会自动判断该聊还是该干活。")
-        print("Ctrl+C 退出。\n")
+        self.ev.ready(
+            LLM=self.llm.model,
+            音色=self.speaker.voice,
+            DSH_agent="开" if self.use_agent else "关",
+        )
+        self.ev.log("说「大肥鱼」叫醒它。它会自动判断该聊还是该干活。")
+        self.ev.log("Ctrl+C 退出。")
         self.loop.run()
 
     # ---------- 收到一句话 ----------
 
     def _on_user_said(self, text: str) -> None:
         if self.speaker.speaking:
-            print("  🤐 打断，停止播报")
+            self.ev.log("🤐 打断，停止播报")
             self.speaker.stop()
         self.speaker.reset()
+
+        self.ev.user_text(text)
 
         # ① 正在等权限答复 → 这句话当回答处理，不派活
         if self._pending_task is not None:
@@ -199,13 +205,14 @@ class Assistant:
             return
 
         if self.agent_busy:
-            print("  ⏳ 之前的任务还在跑")
+            self.ev.log("⏳ 之前的任务还在跑")
             self.speaker.say("我还在忙上一个任务，等一下再说")
             return
 
         route = classify(text)
         self.current_route = route
-        print(f"  🧭 分流：{route}")
+        self.ev.log(f"🧭 分流：{route}")
+        self.ev.state("thinking", route=route.kind, text=text)
 
         if route.kind == "task" and self.use_agent:
             self._do_task(text, route)
@@ -222,18 +229,18 @@ class Assistant:
 
         if any(w in low for w in PERMISSION_NO_WORDS) and not any(
                 w in low for w in PERMISSION_OK_WORDS):
-            print("  🚫 用户拒绝")
+            self.ev.log("🚫 用户拒绝")
             self.speaker.say("好，那我不动了")
             return
 
         if any(w in low for w in PERMISSION_OK_WORDS):
-            print("  ✅ 用户授权，以完整权限重跑")
+            self.ev.log("✅ 用户授权，以完整权限重跑")
             self.speaker.say("好，那我动手了")
             self._run_task(task or "", granted=True)
             return
 
         # 既不是同意也不是拒绝 → 当没听清，再问一次（但不再无限循环）
-        print(f"  ❓ 没听清授权答复：{low}")
+        self.ev.log(f"❓ 没听清授权答复：{low}")
         self.speaker.say("我没听清，你说允许还是不允许")
         self._pending_task = task
         self._perm_deadline = time.time() + PERMISSION_TIMEOUT
@@ -278,7 +285,7 @@ class Assistant:
                 nonlocal buf
                 if first[0] is None:
                     first[0] = time.time()
-                print(d, end="", flush=True)
+                self.ev.delta(d)
                 buf += d
                 while True:
                     m = SENTENCE_END.search(buf)
@@ -291,10 +298,10 @@ class Assistant:
                     flush(head)
 
             def on_tool(name, args):
-                print(f"\n  🔧 {name} {str(args)[:60]}", flush=True)
+                self.ev.tool(name, args)
 
             try:
-                print("\n  🐟 ", end="", flush=True)
+                self.ev.reply_start()
                 if route.kind == "data":
                     reply, used = self.llm.chat_with_tools(
                         text, self.tools, on_delta=on_delta, on_tool=on_tool
@@ -304,13 +311,13 @@ class Assistant:
 
                 flush(buf)
                 ttft = (first[0] - t0) if first[0] else 0
-                print(f"\n  [{ttft:.2f}s 首字 / {time.time()-t0:.2f}s 生成"
-                      f" / {len(spoken)} 句"
-                      + (f" / 工具 {used}" if used else "") + "]\n")
+                self.ev.reply_end(ttft=ttft, total=time.time() - t0,
+                                  sentences=len(spoken), tools=used,
+                                  text=reply)
                 if not reply.strip():
                     self.speaker.say("唔，我没想好说什么")
             except LLMError as e:
-                print(f"\n  ❌ 回复失败：{e}\n")
+                self.ev.error(f"回复失败：{e}")
                 self.speaker.say("呜……我这边卡住了")
             finally:
                 self.thinking = False
@@ -322,7 +329,7 @@ class Assistant:
     def _do_task(self, text: str, route: Route) -> None:
         # 需要写工作区外的文件 → 先问一句
         if self._needs_permission(text):
-            print(f"  🔐 这个任务要写文件，先征得同意")
+            self.ev.permission_ask()
             self.speaker.say(PERMISSION_ASK)
             self._pending_task = text
             self._perm_deadline = time.time() + PERMISSION_TIMEOUT
@@ -331,7 +338,7 @@ class Assistant:
                 time.sleep(PERMISSION_TIMEOUT + 0.5)
                 if self._pending_task == text:
                     self._pending_task = None
-                    print("  ⏱ 权限确认超时，按拒绝处理")
+                    self.ev.log("⏱ 权限确认超时，按拒绝处理")
                     self.speaker.say("没等到你答复，那我先不动了")
             threading.Thread(target=timeout_check, daemon=True).start()
             return
@@ -343,7 +350,7 @@ class Assistant:
         t0 = time.time()
 
         # 第一句垫场：本地秒回
-        print(f"  🔊 垫场1：「{STALL_1}」")
+        self.ev.log(f"🔊 垫场1：「{STALL_1}」")
         self.speaker.say(STALL_1)
 
         second_spoken = [False]
@@ -352,7 +359,7 @@ class Assistant:
             time.sleep(self.stall_delay)
             if self.agent_busy and not second_spoken[0]:
                 second_spoken[0] = True
-                print(f"  🔊 垫场2：「{STALL_2}」")
+                self.ev.log(f"🔊 垫场2：「{STALL_2}」")
                 self.speaker.say(STALL_2)
 
         threading.Thread(target=stall_timer, daemon=True).start()
@@ -360,22 +367,19 @@ class Assistant:
         def on_done(ok: bool, output: str):
             elapsed = time.time() - t0
             self.agent_busy = False
-            print(f"\n  {'✅' if ok else '❌'} 任务{'完成' if ok else '失败'}"
-                  f"，{elapsed:.1f} 秒\n")
+            self.ev.task_done(ok, output)
 
             if ok:
                 say = clean_for_speech(output)
                 if not say:
                     say = "做完了，但没给我内容"
-                print(f"  📄 要念的内容：{say[:120]}…\n")
+                self.ev.log(f"📄 要念的内容：{say[:120]}…")
                 self.speaker.say(say)
             else:
-                print(f"  错误：{output[:200]}")
+                self.ev.log(f"错误：{output[:200]}")
                 self.speaker.say("呜……这个任务没做成")
 
-        print(f"  🚀 派给 DSH agent"
-              f"{'（完整权限）' if granted else '（工作区沙箱）'}："
-              f"{text[:36]}{'…' if len(text)>36 else ''}")
+        self.ev.task_start(text, granted)
         self.agent.run_async(text, on_done, permission_mode=(
             "danger-full-access" if granted else "workspace-write"
         ))
@@ -383,20 +387,27 @@ class Assistant:
     # ---------- 界面 ----------
 
     def _render(self, rms: float) -> None:
+        # 状态只在「变化时」上报（每帧都发会把管道刷爆）
         if self.agent_busy:
-            icon = "⚙️"
+            icon, name = "⚙️", "busy"
         elif self.thinking:
-            icon = "🤔"
+            icon, name = "🤔", "thinking"
         elif self.speaker.busy:
-            icon = "🗣"
+            icon, name = "🗣", "speaking"
         elif self.loop.speaking:
-            icon = "🔴"
+            icon, name = "🔴", "hearing"
         elif self.loop.state == "awake":
-            icon = "👂"
+            icon, name = "👂", "listening"
         else:
-            icon = "💤"
+            icon, name = "💤", "idle"
+
+        if name != getattr(self, "_last_state", None):
+            self._last_state = name
+            self.ev.state(name)
+
         bar = "█" * int(min(rms * 200, 20))
-        print(f"\r {icon} {rms:.3f} {bar:<20}", end="", flush=True)
+        if isinstance(self.ev, ConsoleEvents):
+            print(f"\r {icon} {rms:.3f} {bar:<20}", end="", flush=True)
 
 
 def main() -> int:

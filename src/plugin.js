@@ -20,6 +20,8 @@ import {
 const require = createRequire(import.meta.url)
 const pkg = require('../package.json')
 
+import { createVoiceBridge } from './voice-bridge.js'
+
 export const name = 'dsh-dafeiyu'
 // The plugin's feature is built on session events, and mounting requires the
 // settings service (used to read live config). Keep the declared inject in
@@ -61,6 +63,16 @@ export const Config = Schema.object({
   clientTarget: Schema.union(['auto', 'web', 'desktop']).default('auto').description('打开 DSH 的目标客户端（自动识别 WebUI／桌面端）'),
   balanceEnabled: Schema.boolean().default(true).description('在状态气泡和设置页显示 DeepSeek 余额'),
   balanceSource: Schema.union(['auto', 'api-key', 'account']).default('auto').description('余额来源：自动优先 API Key，也可选择已登录账户'),
+
+  // ── 语音（本 fork 新增）──────────────────────────────────────────
+  voiceEnabled: Schema.boolean().default(false).description('启用语音对话（唤醒词、听说）'),
+  voiceWakeWord: Schema.string().default('大肥鱼').description('唤醒词（需与 kws-model/keywords.txt 一致）'),
+  voiceTts: Schema.string().default('Cherry').description('TTS 音色（Cherry / Serena / Chelsie / Ethan）'),
+  voiceLlm: Schema.string().default('qwen-flash').description('对话模型'),
+  voiceAgent: Schema.boolean().default(true).description('长任务交给 DSH agent 执行'),
+  voiceAskPermission: Schema.boolean().default(true).description('写工作区外文件前先语音确认'),
+  voicePython: Schema.string().default('python').description('Python 解释器（跑语音服务的那个）'),
+  voiceModelDir: Schema.string().default('').description('KWS 模型目录（留空用插件目录下的 kws-model）'),
 }).description('由 DeepSeek Harness 状态驱动的桌面大肥鱼伴侣')
 
 // Mark fields, rather than the root object: current DSH passes each volatile
@@ -82,6 +94,15 @@ const defaults = Object.freeze({
   clientTarget: 'auto',
   balanceEnabled: true,
   balanceSource: 'auto',
+  // 语音（本 fork）
+  voiceEnabled: false,
+  voiceWakeWord: '大肥鱼',
+  voiceTts: 'Cherry',
+  voiceLlm: 'qwen-flash',
+  voiceAgent: true,
+  voiceAskPermission: true,
+  voicePython: 'python',
+  voiceModelDir: '',
 })
 
 const SOUND_STATES = new Set(['SUCCESS', 'ERROR', 'APPROVAL'])
@@ -107,6 +128,15 @@ function publicConfig(config = {}) {
     clientTarget: config.clientTarget ?? defaults.clientTarget,
     balanceEnabled: config.balanceEnabled !== false,
     balanceSource: config.balanceSource ?? defaults.balanceSource,
+    // 语音（本 fork）
+    voiceEnabled: config.voiceEnabled === true,
+    voiceWakeWord: config.voiceWakeWord ?? defaults.voiceWakeWord,
+    voiceTts: config.voiceTts ?? defaults.voiceTts,
+    voiceLlm: config.voiceLlm ?? defaults.voiceLlm,
+    voiceAgent: config.voiceAgent !== false,
+    voiceAskPermission: config.voiceAskPermission !== false,
+    voicePython: config.voicePython || defaults.voicePython,
+    voiceModelDir: config.voiceModelDir || '',
   }
 }
 
@@ -489,6 +519,118 @@ function mountCompanion(ctx, config = {}, eventCtx = ctx, logger) {
   startRuntime(settings.get())
   balance.configure(settings.get().enabled !== false && settings.get().balanceEnabled, settings.get().balanceSource)
 
+  // ── 语音服务（本 fork 新增）─────────────────────────────────────────
+  // 独立进程，JSONL 走 stdio。语音状态映射成桌宠状态，识别/回复文字进气泡。
+  // 单独进程而不是塞进 helper：语音挂了不影响桌宠动画，反之亦然。
+  let voice = null
+
+  /** 语音状态 → 桌宠状态 */
+  const VOICE_STATE_MAP = {
+    idle: CompanionState.IDLE,
+    listening: CompanionState.WAITING,
+    hearing: CompanionState.WAITING,
+    thinking: CompanionState.THINKING,
+    speaking: CompanionState.WORKING,
+    busy: CompanionState.WORKING,
+  }
+
+  function pushVoiceText(title, detail) {
+    if (!bridge || !detail) return
+    try {
+      bridge.send(createMessage(CompanionMessageKind.TASK, {
+        task: '语音对话',
+        message: title,
+        detail: String(detail).slice(0, 300),
+        project: '大肥鱼',
+        progress: { step: 1, total: 1 },
+      }))
+    } catch (error) {
+      logger.warn?.(`dsh-dafeiyu: 语音文字推送失败 ${error?.message ?? error}`)
+    }
+  }
+
+  function handleVoiceEvent(msg) {
+    try {
+      switch (msg?.kind) {
+        case 'state': {
+          const mapped = VOICE_STATE_MAP[msg.state]
+          if (mapped && bridge) {
+            bridge.send(createMessage(CompanionMessageKind.STATE, {
+              state: mapped,
+              phase: 'voice',
+              stage: msg.state,
+              message: '',
+              detail: '',
+            }))
+          }
+          break
+        }
+        case 'user_text':
+          pushVoiceText('你说', msg.text)
+          break
+        case 'reply_end':
+          pushVoiceText('大肥鱼', msg.text)
+          break
+        case 'task_start':
+          pushVoiceText('派活', msg.task)
+          break
+        case 'permission_ask':
+          pushVoiceText('需要授权', '要写文件，等你答复')
+          break
+        case 'tool':
+          logger.info?.(`[voice] 调用工具 ${msg.name}`)
+          break
+        case 'task_done':
+          logger.info?.(`[voice] 任务${msg.ok ? '完成' : '失败'}`)
+          break
+        case 'error':
+          logger.warn?.(`[voice] ${msg.message}`)
+          break
+        default:
+          break
+      }
+    } catch (error) {
+      logger.error?.('dsh-dafeiyu: 处理语音事件失败', error)
+    }
+  }
+
+  function voiceConfigOf(next) {
+    return {
+      voice: next.voiceTts || 'Cherry',
+      llmModel: next.voiceLlm || 'qwen-flash',
+      useAgent: next.voiceAgent !== false,
+      askPermission: next.voiceAskPermission !== false,
+      modelDir: next.voiceModelDir || undefined,
+    }
+  }
+
+  function startVoice(next) {
+    if (voice) return
+    if (next.voiceEnabled !== true) return
+    voice = createVoiceBridge({
+      pythonPath: next.voicePython || 'python',
+      config: voiceConfigOf(next),
+      onEvent: handleVoiceEvent,
+      logger,
+      autoStart: true,
+    })
+    voice.start()
+    logger.info?.('dsh-dafeiyu voice bridge started')
+  }
+
+  function stopVoice(reason) {
+    if (!voice) return
+    try {
+      voice.dispose()
+    } catch {
+      /* 进程可能已经没了 */
+    }
+    voice = null
+    logger.info?.(`dsh-dafeiyu voice bridge stopped (${reason})`)
+  }
+
+  startVoice(settings.get())
+
   // The companion intentionally observes every DSH session. Loader entries may
   // live inside a scoped composition, so use the unscoped root bus and dispose
   // the registrations explicitly with this plugin's lifecycle.
@@ -520,6 +662,20 @@ function mountCompanion(ctx, config = {}, eventCtx = ctx, logger) {
     // to avoid spawning repeatedly while settings settle.
     try {
       balance.configure(next.enabled !== false && next.balanceEnabled, next.balanceSource)
+
+      // 语音：总开关关掉就一起停；开着就按需启动 / 热推配置
+      try {
+        if (next.enabled === false || next.voiceEnabled !== true) {
+          stopVoice('settings-change')
+        } else if (!voice) {
+          startVoice(next)
+        } else {
+          voice.updateConfig(voiceConfigOf(next))
+        }
+      } catch (error) {
+        logger.warn?.(`dsh-dafeiyu: 语音设置更新失败 ${error?.message ?? error}`)
+      }
+
       if (next.enabled === false) {
         if (restartTimer) {
           clearTimeout(restartTimer)
@@ -593,6 +749,7 @@ function mountCompanion(ctx, config = {}, eventCtx = ctx, logger) {
     unwatch()
     settings.dispose?.()
     balance.stop()
+    stopVoice('dsh-host-stop')
     stopRuntime('dsh-host-stop')
   })
 }

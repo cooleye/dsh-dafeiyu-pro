@@ -21,3 +21,14 @@
         clientTarget: auto
         balanceEnabled: true
         balanceSource: auto
+        # ── 语音（本 fork 新增）──────────────────────────────────
+        # 默认关。开了会 spawn 一个 voice_service.py 子进程。
+        # 需要 apikey.txt 里有 qwen（ASR/TTS/对话）和 bochaai（搜索）。
+        voiceEnabled: false
+        voiceWakeWord: 大肥鱼
+        voiceTts: Cherry
+        voiceLlm: qwen-flash
+        voiceAgent: true
+        voiceAskPermission: true
+        voicePython: python
+        voiceModelDir: ''

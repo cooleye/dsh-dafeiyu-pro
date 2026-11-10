@@ -50,6 +50,26 @@ SENTENCE_END = re.compile(r"[。！？!?；;\n]+")
 MIN_SENTENCE_CHARS = 2
 # 攒够这么多字即使没有标点也先念（防止长句憋着不出声）
 MAX_BUFFER_CHARS = 40
+# 长句硬切时优先在这些地方断，念起来更自然
+SOFT_BREAK = "，、,：: "
+
+
+def split_long(text: str, limit: int = MAX_BUFFER_CHARS) -> tuple[str, str]:
+    """把过长的文本切出一段（不超过 limit），返回 (head, tail)。
+
+    优先在逗号/顿号/空格处断；找不到就硬切。
+    硬切时会在 limit 附近往回找 SOFT_BREAK，最多回退 1/3。
+    """
+    if len(text) <= limit:
+        return text, ""
+
+    # 在 [limit*2//3, limit] 区间里找最靠后的软断点
+    lo = max(1, limit * 2 // 3)
+    for i in range(limit, lo - 1, -1):
+        if i < len(text) and text[i - 1] in SOFT_BREAK:
+            return text[:i], text[i:]
+    # 没有软断点 → 硬切
+    return text[:limit], text[limit:]
 
 
 class Speaker:
@@ -182,6 +202,7 @@ class ChatLoop:
                     spoken.append(s)
 
             def on_delta(d):
+                nonlocal buf
                 if first_delta[0] is None:
                     first_delta[0] = time.time()
                 print(d, end="", flush=True)
@@ -193,10 +214,10 @@ class ChatLoop:
                         break
                     flush(buf[:m.start()])
                     buf = buf[m.end():]
-                # 太长还没标点，也先念一段
-                if len(buf) >= MAX_BUFFER_CHARS:
-                    flush(buf)
-                    buf = ""
+                # 太长还没标点，也先切一段念（防止长句憋着不出声）
+                while len(buf) >= MAX_BUFFER_CHARS:
+                    head, buf = split_long(buf)
+                    flush(head)
 
             try:
                 print("\n  🐟 ", end="", flush=True)

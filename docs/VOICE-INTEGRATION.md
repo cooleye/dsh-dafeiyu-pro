@@ -56,18 +56,55 @@ DSH 主进程 (Node)
 
 当前 profile 装的是上游 npm 包 `dsh-dafeiyu`。要换成本仓库：
 
+**方式 A：插件管理页（推荐，不用命令行）**
+
+```
+设置 → 插件 → 添加插件 → 填 link:D:\project\dsh-dafeiyu-pro
+然后卸掉旧的 dsh-dafeiyu
+```
+
+**方式 B：命令行**
+
+`dsh` 命令不在 PATH 里，要么用完整路径，要么用 `npx`：
+
 ```powershell
-cd D:\project\dsh-dafeiyu-pro
+# 完整路径（DeepSeek Harness 桌面端自带）
+& 'D:\Program Files (x86)\deepseek\resources\runtime\cli\bin\dsh.cmd' `
+    plugin --profile desktop remove dsh-dafeiyu
 
-# 先卸掉上游版本（否则会有两个桌宠窗口）
-dsh plugin --profile desktop remove dsh-dafeiyu
-
-# 装本仓库（link 模式，改代码实时生效）
-dsh plugin --profile desktop add link:D:\project\dsh-dafeiyu-pro
+& 'D:\Program Files (x86)\deepseek\resources\runtime\cli\bin\dsh.cmd' `
+    plugin --profile desktop add link:D:\project\dsh-dafeiyu-pro
 ```
 
 > ⚠️ 两条命令都**需要先完全退出 DSH 桌面端**，
 > 因为正在运行时会占用插件文件。
+
+### 1.5 ⚠️ 补齐预编译 helper（link 安装必看）
+
+`runtime/bin/` 在上游 `.gitignore` 里（各平台构建产物，不进版本库），
+所以从源码 link 安装时**桌宠窗口会因为找不到 helper 而启动失败**。
+
+从已安装的副本捞回来：
+
+```powershell
+# 1. 找到之前安装留下的 helper
+Get-ChildItem "$env:LOCALAPPDATA\dsh-dafeiyu" -Recurse -Filter 'dsh-dafeiyu-helper-*.exe'
+
+# 2. 复制到仓库里它期望的位置
+New-Item -ItemType Directory -Path 'D:\project\dsh-dafeiyu-pro\runtime\bin\win32-x64' -Force
+Copy-Item "$env:LOCALAPPDATA\dsh-dafeiyu\<版本号>\dsh-dafeiyu-helper-<哈希>.exe" `
+          'D:\project\dsh-dafeiyu-pro\runtime\bin\win32-x64\dsh-dafeiyu-helper.exe'
+```
+
+或者自己构建：
+
+```powershell
+cd D:\project\dsh-dafeiyu-pro
+npm run build:helper:windows
+```
+
+> 💡 没有 helper 时的退化路径：用 `python runtime/helper.py` 跑，
+> 但要求系统 Python 装了 `PySide6`（`requirements.txt` 里那个）。
 
 ### 2. 确认依赖
 

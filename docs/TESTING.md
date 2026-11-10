@@ -106,6 +106,68 @@ python phase1_wake_reply.py --reply "叫我干嘛"
 
 ---
 
+## 测试四：让它听懂你说什么（Phase 2，需要 API Key）
+
+```powershell
+python phase2_listen.py
+```
+
+**这个才是真·对话的第一步**——它能把你说的话转成文字。
+
+**你应该看到**：
+```
+=== 唤醒 → 听写 Demo ===
+
+  设备：Windows WDM-KS / 麦克风 (Speakerphone)
+  采样率：48000 Hz → 重采样 16000
+  唤醒后 20 秒内不说话会退回待命
+
+说「大肥鱼」叫醒它，然后直接说话。Ctrl+C 退出。
+
+ 💤 0.008 ██
+```
+
+**操作**：
+1. 说 **「大肥鱼」** → 它回「我在」，图标变成 👂
+2. **直接说一句话**，比如「今天天气怎么样」
+3. 说完停顿 1 秒 → 自动断句
+4. 看到 `💬 你说：今天天气怎么样？`
+5. 继续说话它会继续识别
+6. 20 秒不说话，自动退回待命（💤）
+7. `Ctrl + C` 退出
+
+**效果参考**：
+```
+  🎯 唤醒：大肥鱼
+  🔊 「我在」
+  👂 在听...
+
+ ⏳ 今天天气怎么样
+  📤 断句（2100ms），等识别结果 ...
+  💬 你说：今天天气怎么样？给我讲个故事呗。
+```
+
+**前提**：需要 `apikey.txt` 里有 `qwen:sk-xxx`（阿里云 DashScope）。
+
+**注意**：这个要联网，而且**按调用计费**。
+
+---
+
+## 测试五：只听 ASR（不用唤醒词）
+
+```powershell
+python asr_aliyun.py --mic
+```
+
+直接说话就识别，不用先叫名字。适合单独验证 ASR 效果。
+
+**用文件测**（不用麦克风）：
+```powershell
+python asr_aliyun.py --wav "D:\project\desk-ai\.kws-download\asr-test.wav"
+```
+
+---
+
 ## 测试四：录音看看效果
 
 ```powershell
@@ -217,6 +279,10 @@ py phase1_wake_reply.py
 | 听它说话 | `python audio_player.py --say "你好"` |
 | 测唤醒词 | `python phase0_kws_poc.py` |
 | **唤醒+回应** | `python phase1_wake_reply.py` |
+| **唤醒+听写** | `python phase2_listen.py` |
+| 只测 ASR | `python asr_aliyun.py --mic` |
+| 用文件测 ASR | `python asr_aliyun.py --wav test.wav` |
+| 查配置 | `python voice_config.py` |
 | 换回应语 | `python phase1_wake_reply.py --reply "在呢"` |
 | 录一段 | `python record_wav.py test.wav -d 3` |
 | 采样本 | `python collect_samples.py pos --count 10` |

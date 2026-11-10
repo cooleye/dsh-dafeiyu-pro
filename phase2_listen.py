@@ -76,10 +76,13 @@ class VoiceLoop:
         dialogue_timeout: float = DEFAULT_DIALOGUE_TIMEOUT,
         score: float = 3.0,
         threshold: float = 0.1,
+        on_transcript=None,
     ):
         self.api_key = api_key
         self.wake_reply = wake_reply
         self.dialogue_timeout = dialogue_timeout
+        # 识别出一句就回调（Phase 3 用它接 LLM）
+        self.on_transcript = on_transcript
 
         # KWS
         self.spotter, self.kws_stream = create_spotter(
@@ -293,6 +296,11 @@ class VoiceLoop:
                 if text:
                     self.transcripts.append(text)
                     print(f"\n  💬 你说：{text}\n")
+                    if self.on_transcript:
+                        try:
+                            self.on_transcript(text)
+                        except Exception as e:
+                            print(f"\n  ❌ on_transcript 回调失败：{e}\n")
                 else:
                     print("\n  （没识别出内容）\n")
             except Exception as e:

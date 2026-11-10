@@ -153,7 +153,78 @@ python phase2_listen.py
 
 ---
 
-## 测试五：只听 ASR（不用唤醒词）
+## 测试五：完整语音对话（推荐！Phase 3）
+
+```powershell
+python phase3_chat.py
+```
+
+**这个是真·聊天了**——它会听懂、会思考、会开口回答。
+
+**操作**：
+1. 说 **「大肥鱼」** → 回「我在」，图标 👂
+2. 说一句话，比如「用两句话介绍你自己」
+3. 看到 `💬 你说：...` → `🤔 思考中` → `🐟 哼，本鱼是...`
+4. **它会念出来**（图标变 🗣）
+
+**打断**：它念的时候你直接说话，它立刻闭嘴听你说。
+
+**换音色**：
+```powershell
+python phase3_chat.py --voice Serena
+python phase3_chat.py --voice Chelsie
+python phase3_chat.py --voice Ethan
+```
+
+**换模型**：
+```powershell
+python phase3_chat.py --llm qwen-plus
+python phase3_chat.py --llm qwen-max
+```
+
+**关掉打断**（如果你觉得误触发）：
+```powershell
+python phase3_chat.py --no-bargein
+```
+
+**自定义人设**：
+```powershell
+python phase3_chat.py --persona "你是一只高冷的猫，说话不超过十个字"
+python phase3_chat.py --persona-file mypersona.txt
+```
+
+**效果参考**：
+```
+ 👂 0.005
+  🎯 唤醒：大肥鱼
+  🔊 「我在」
+  👂 在听...
+
+ 🔴 0.210
+  📤 断句（2100ms），等识别结果 ...
+  💬 你说：用两句话介绍你自己
+
+  🤔 思考中 ...
+  🐟 哼，本鱼是大肥鱼，圆滚滚软乎乎的胖鱼。
+  [0.33s 首字 / 0.57s 生成 / 2 句]
+  🗣 播放中...
+```
+
+---
+
+## 测试六：不用麦克风，验证对话管线
+
+```powershell
+python test_phase3.py --say "你是谁"
+python test_phase3.py --say "讲个笑话" --voice Serena
+python test_phase3.py --no-audio          # 只测 LLM，不合成不播放
+```
+
+这个不需要麦克风，直接验证「文字 → LLM → 分句 → TTS → 播放」整条链。
+
+---
+
+## 测试七：只听 ASR（不用唤醒词）
 
 ```powershell
 python asr_aliyun.py --mic
@@ -164,6 +235,25 @@ python asr_aliyun.py --mic
 **用文件测**（不用麦克风）：
 ```powershell
 python asr_aliyun.py --wav "D:\project\desk-ai\.kws-download\asr-test.wav"
+```
+
+---
+
+## 测试八：单独测 TTS
+
+```powershell
+python tts_qwen.py --say "你好，我是大肥鱼"
+python tts_qwen.py --say "我在生气" --instruct "用生气的语气说"
+python tts_qwen.py --say "..." --voice Serena --out test.wav
+```
+
+---
+
+## 测试九：单独测 LLM
+
+```powershell
+python llm_qwen.py --ask "今天天气怎么样"
+python llm_qwen.py --chat               # 交互式多轮，输入 exit 退出
 ```
 
 ---
@@ -278,15 +368,18 @@ py phase1_wake_reply.py
 |---|---|
 | 听它说话 | `python audio_player.py --say "你好"` |
 | 测唤醒词 | `python phase0_kws_poc.py` |
-| **唤醒+回应** | `python phase1_wake_reply.py` |
-| **唤醒+听写** | `python phase2_listen.py` |
+| 唤醒+回应 | `python phase1_wake_reply.py` |
+| 唤醒+听写 | `python phase2_listen.py` |
+| **完整语音对话** | `python phase3_chat.py` |
+| 只测对话管线 | `python test_phase3.py --say "你是谁"` |
+| 换音色 | `python phase3_chat.py --voice Serena` |
 | 只测 ASR | `python asr_aliyun.py --mic` |
-| 用文件测 ASR | `python asr_aliyun.py --wav test.wav` |
+| 只测 TTS | `python tts_qwen.py --say "你好"` |
+| 只测 LLM | `python llm_qwen.py --ask "你好"` |
 | 查配置 | `python voice_config.py` |
-| 换回应语 | `python phase1_wake_reply.py --reply "在呢"` |
 | 录一段 | `python record_wav.py test.wav -d 3` |
 | 采样本 | `python collect_samples.py pos --count 10` |
-| 测准确率 | `python phase0_kws_poc.py --eval ./samples/pos --neg ./samples/neg` |
+| 测唤醒准确率 | `python phase0_kws_poc.py --eval ./samples/pos --neg ./samples/neg` |
 | 查设备 | `python phase0_kws_poc.py --list-devices` |
 | 调灵敏 | `python phase1_wake_reply.py --score 4.0` |
 | 调阈值 | `python phase1_wake_reply.py --threshold 0.3` |

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import threading
 import time
@@ -186,13 +187,50 @@ def run_stdio(config: dict | None = None) -> int:
     # ⚠️ 关键：把 stdout 换成 stderr，让所有杂项 print 都进 stderr，
     #    真 stdout 留给协议。否则桌宠会收到一堆「💬 你说」污染协议。
     real_stdout = sys.stdout
-    sys.stdout = sys.stderr
+    real_stderr = sys.stderr
 
-    ev = JsonlEvents(stream=real_stdout)
+    # 日志同时写文件：桌宠模式下看不到 stderr，排查全靠这个。
+    # ⚠️ 必须连 sys.stderr 一起接管 —— 只给 JsonlEvents 传 tee 的话，
+    #    VoiceLoop 里那些裸 print（设备信息、断句、唤醒）抓不到。
+    log_stream = _open_log_file()
+
+    class _Tee:
+        def __init__(self, original):
+            self.original = original
+
+        def write(self, s):
+            try:
+                self.original.write(s)
+            except Exception:
+                pass
+            if log_stream:
+                try:
+                    log_stream.write(s)
+                    log_stream.flush()
+                except Exception:
+                    pass
+            return len(s) if s else 0
+
+        def flush(self):
+            try:
+                self.original.flush()
+            except Exception:
+                pass
+            if log_stream:
+                try:
+                    log_stream.flush()
+                except Exception:
+                    pass
+
+    tee = _Tee(real_stderr)
+    sys.stdout = tee
+    sys.stderr = tee
+
+    ev = JsonlEvents(stream=real_stdout, err=tee)
     service = VoiceService(ev, config)
 
     ev.ready(version=VERSION, python=sys.version.split()[0])
-
+    ev.log(f"日志文件：{_log_path()}")
     alive = True
 
     def reader():
@@ -224,7 +262,36 @@ def run_stdio(config: dict | None = None) -> int:
         pass
     finally:
         service.stop()
+        if log_stream:
+            try:
+                log_stream.close()
+            except Exception:
+                pass
     return 0
+
+
+def _log_path() -> Path:
+    base = Path(os.environ.get("LOCALAPPDATA", os.path.expanduser("~")))
+    return base / "dsh-dafeiyu" / "logs" / "voice.log"
+
+
+def _open_log_file():
+    """打开日志文件（追加）。失败就算了，不影响主功能。"""
+    try:
+        p = _log_path()
+        p.parent.mkdir(parents=True, exist_ok=True)
+        # 超过 2MB 就轮转一次
+        if p.exists() and p.stat().st_size > 2 * 1024 * 1024:
+            old = p.with_suffix(".log.1")
+            try:
+                if old.exists():
+                    old.unlink()
+                p.rename(old)
+            except Exception:
+                pass
+        return open(p, "a", encoding="utf-8", errors="replace")
+    except Exception:
+        return None
 
 
 def run_selftest() -> int:

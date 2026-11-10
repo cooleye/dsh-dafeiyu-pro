@@ -458,6 +458,12 @@ class Assistant:
             self._last_state = name
             self.ev.state(name)
 
+        # 每 3 秒把音量记进日志（排查「叫了没反应」全靠这个）
+        now = time.time()
+        if now - getattr(self, "_last_rms_log", 0.0) >= 3.0:
+            self._last_rms_log = now
+            self.ev.log(f"音量 {rms:.5f}（状态 {name}）")
+
         bar = "█" * int(min(rms * 200, 20))
         if isinstance(self.ev, ConsoleEvents):
             print(f"\r {icon} {rms:.3f} {bar:<20}", end="", flush=True)

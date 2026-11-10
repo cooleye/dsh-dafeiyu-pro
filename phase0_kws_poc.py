@@ -243,12 +243,20 @@ def input_candidates(preferred: int | None = None,
         dev = sd.query_devices(preferred)
         return [(preferred, int(dev["default_samplerate"]), f"手动指定：{dev['name']}")]
 
-    SHARED_RANK = {"Windows WASAPI": 0, "Windows DirectSound": 1, "MME": 2,
+    # 共享模式的优先级。
+    #
+    # ⚠️ 为什么 MME 排第一（反直觉，但是实测的）：
+    #    同样放一段声音，三个后端拾音能量差很多：
+    #      MME      峰值 0.0116
+    #      WASAPI   峰值 0.0011   ← 只有 MME 的 1/10，约 -20dB
+    #    WASAPI 的默认端点大概是「通信设备」，系统在上面套了 AGC/降噪，
+    #    结果 KWS 根本听不清。MME 延迟高一点，但信号是实的。
+    SHARED_RANK = {"MME": 0, "Windows DirectSound": 1, "Windows WASAPI": 2,
                    "Windows WDM-KS": 9}
-    EXCLUSIVE_RANK = {"Windows WDM-KS": 0, "Windows WASAPI": 1,
-                      "Windows DirectSound": 2, "MME": 3}
-    AUTO_RANK = {"Windows WASAPI": 0, "Windows WDM-KS": 1,
-                 "Windows DirectSound": 2, "MME": 3}
+    EXCLUSIVE_RANK = {"Windows WDM-KS": 0, "MME": 1,
+                      "Windows DirectSound": 2, "Windows WASAPI": 3}
+    AUTO_RANK = {"MME": 0, "Windows WDM-KS": 1,
+                 "Windows DirectSound": 2, "Windows WASAPI": 3}
 
     mode = (mode or "shared").lower()
     host_rank = {"exclusive": EXCLUSIVE_RANK,

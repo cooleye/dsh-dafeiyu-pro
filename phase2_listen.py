@@ -147,19 +147,31 @@ class VoiceLoop:
 
         # 逐个候选试开：开流失败就换下一个后端
         # （check_input_settings 只校验格式，不代表现在能打开）
+        #
+        # ⚠️ sounddevice 抛的是 PortAudioError，它直接继承 Exception，
+        #    **不是** OSError —— 一开始写 `except OSError` 完全没接住，
+        #    回退逻辑形同虚设，报错直接冲到最外面。
         last_err = None
-        for idx, (dev, rate, desc) in enumerate(self.audio_candidates):
-            self.device, self.sample_rate, self.device_desc = dev, rate, desc
-            self.native_16k = rate == 16000
-            try:
-                self._run_stream()
+        opened = False
+        # 走两轮：设备刚被别的程序释放时，第一轮可能全失败，等一下再试
+        for attempt in range(2):
+            for idx, (dev, rate, desc) in enumerate(self.audio_candidates):
+                self.device, self.sample_rate, self.device_desc = dev, rate, desc
+                self.native_16k = rate == 16000
+                try:
+                    self._run_stream()
+                    opened = True
+                    break
+                except (sd.PortAudioError, OSError) as e:
+                    last_err = e
+                    if idx < len(self.audio_candidates) - 1:
+                        print(f"\n  ⚠️ {desc} 打不开（{str(e)[:60]}），换下一个后端 …")
+                        time.sleep(0.3)
+            if opened:
                 return
-            except OSError as e:
-                last_err = e
-                if idx < len(self.audio_candidates) - 1:
-                    print(f"\n  ⚠️ {desc} 打不开（{e}），换下一个后端 …")
-                    continue
-                break
+            if attempt == 0:
+                print("\n  ⏳ 所有后端都失败，1.5 秒后重试（设备可能还在释放）…")
+                time.sleep(1.5)
 
         print(f"\n\n  ❌ 所有音频后端都打不开：{last_err}")
         print("     多半是被别的程序占着了。检查：")
